@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------
-  AllBags 1.0.0
+  AllBags 1.0.1
   Все сумки (0-4) в одном окне. Клиент 1.12.1 / Lua 5.1 (Emberveil).
 
   Сортировка ВИРТУАЛЬНАЯ: предметы в сумках не двигаются, меняется только
@@ -8,7 +8,7 @@
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 
 local FIRST_BAG, LAST_BAG = 0, 4
 
@@ -16,8 +16,14 @@ local SIZE, GAP, PAD = 32, 0, 4
 local HEADER, FOOTER = 26, 20
 local MIN_WIDTH = 300   -- ровно столько, сколько нужно шапке
 
+-- Положение окна храним АБСОЛЮТНЫМИ координатами левого нижнего угла, а не
+-- парой якорей. StartMoving переанкоривает фрейм по своему усмотрению, и
+-- сохранённая через GetPoint пара при восстановлении могла не совпасть с
+-- исходной — окно уезжало в угол экрана. x и y отсутствуют до первого
+-- перетаскивания: тогда окно встаёт в правый нижний угол.
+local DEFAULT_MARGIN = 20
+
 local defaults = {
-  point = "CENTER", relPoint = "CENTER", x = 0, y = 0,
   cols = 10, sort = "quality", lang = "auto", enabled = true, line = 1, border = 6,
 }
 
@@ -531,8 +537,7 @@ local function MenuItems()
 
   add({ mark = "none", text = L("mReset"),
         action = function()
-          AllBagsDB.point, AllBagsDB.relPoint = defaults.point, defaults.relPoint
-          AllBagsDB.x, AllBagsDB.y = defaults.x, defaults.y
+          AllBagsDB.x, AllBagsDB.y = nil, nil
           ApplyPosition()
         end })
 
@@ -693,16 +698,29 @@ ApplyBorder = function()
 end
 
 ApplyPosition = function()
+  if not frame then return end
   frame:ClearAllPoints()
-  frame:SetPoint(AllBagsDB.point, UIParent, AllBagsDB.relPoint, AllBagsDB.x, AllBagsDB.y)
+
+  local x, y = AllBagsDB.x, AllBagsDB.y
+  if type(x) == "number" and type(y) == "number" then
+    frame:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", x, y)
+  else
+    frame:SetPoint("BOTTOMRIGHT", UIParent, "BOTTOMRIGHT", -DEFAULT_MARGIN, DEFAULT_MARGIN)
+  end
 end
 
 SavePosition = function()
-  local point, _, relPoint, x, y = frame:GetPoint(1)
-  if point then
-    AllBagsDB.point, AllBagsDB.relPoint = point, relPoint or point
-    AllBagsDB.x, AllBagsDB.y = x or 0, y or 0
-  end
+  if not frame then return end
+
+  local left, bottom = frame:GetLeft(), frame:GetBottom()
+  if type(left) ~= "number" or type(bottom) ~= "number" then return end
+
+  AllBagsDB.x, AllBagsDB.y = left, bottom
+
+  -- сразу приводим якорь к тому же виду, в котором будем восстанавливать:
+  -- дальше окно растёт вверх при смене числа рядов, а низ остаётся на месте
+  frame:ClearAllPoints()
+  frame:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left, bottom)
 end
 
 local function BuildFrame()
@@ -715,7 +733,7 @@ local function BuildFrame()
   frame:RegisterForDrag("LeftButton")
   frame:SetWidth(400)
   frame:SetHeight(300)
-  frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+  frame:SetPoint("BOTTOMRIGHT", UIParent, "BOTTOMRIGHT", -DEFAULT_MARGIN, DEFAULT_MARGIN)
   ApplyBorder()
   frame:Hide()
 
@@ -819,6 +837,7 @@ local function BuildFrame()
   end)
 
   frame:SetScript("OnShow", function()
+    ApplyPosition()
     header:SetText(L("title"))
     hintText:SetText(L("hint"))
     offButton:SetText(L("btnOff"))
@@ -1007,8 +1026,7 @@ local function HandleSlash(msg)
     end
 
   elseif msg == "reset" then
-    AllBagsDB.point, AllBagsDB.relPoint = defaults.point, defaults.relPoint
-    AllBagsDB.x, AllBagsDB.y = defaults.x, defaults.y
+    AllBagsDB.x, AllBagsDB.y = nil, nil
     ApplyPosition()
     Print(L("reset"))
 
