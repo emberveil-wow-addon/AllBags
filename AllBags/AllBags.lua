@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------
-  AllBags 1.0.1
+  AllBags 1.0.2
   All bags (0-4) in one window. Client 1.12.1 / Lua 5.1 (Emberveil).
 
   The sort is VIRTUAL: nothing moves inside the bags, only the display order
@@ -8,7 +8,7 @@
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
-local VERSION = "1.0.1"
+local VERSION = "1.0.2"
 
 local FIRST_BAG, LAST_BAG = 0, 4
 
@@ -25,6 +25,8 @@ local DEFAULT_MARGIN = 20
 
 local defaults = {
   cols = 10, sort = "quality", lang = "auto", enabled = true, line = 1, border = 6,
+  value = true,     -- show what the bags are worth, when the price addon is there
+  bank = false,     -- and what the bank held, when it knows that too
 }
 
 ----------------------------------------------------------------------
@@ -51,8 +53,11 @@ local STRINGS = {
     msgOn    = "аддон включён, сумки открываются общим окном.",
     colsSet  = "столбцов: %d",
     colsErr  = "укажите число от 4 до 20, например: /bags cols 10",
-    help     = "команды: /bags [menu | sort | cols N | border N | lang ru/en/auto | on | off | reset]",
+    help     = "команды: /bags [menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
     reset    = "позиция сброшена.",
+    valueSet = "стоимость сумок: %s",
+    on       = "вкл",
+    off      = "выкл",
     langSet  = "язык: %s",
     mSort    = "Сортировка",
     mByQ     = "По качеству",
@@ -63,6 +68,11 @@ local STRINGS = {
     mReset   = "Сбросить позицию",
     mClose   = "Закрыть окно",
     tipMenu  = "ПКМ по рамке — меню",
+    value    = "Стоимость",
+    bank     = "Банк",
+    mValue   = "Показывать стоимость",
+    mBank    = "Показывать стоимость банка",
+    noPriceAddon = "ItemLens не установлен — считать стоимость нечем.",
   },
   en = {
     title    = "Bags",
@@ -83,8 +93,11 @@ local STRINGS = {
     msgOn    = "addon enabled, bags open in the combined window.",
     colsSet  = "columns: %d",
     colsErr  = "give a number from 4 to 20, for example: /bags cols 10",
-    help     = "commands: /bags [menu | sort | cols N | border N | lang ru/en/auto | on | off | reset]",
+    help     = "commands: /bags [menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
     reset    = "position reset.",
+    valueSet = "bag value: %s",
+    on       = "on",
+    off      = "off",
     langSet  = "language: %s",
     mSort    = "Sorting",
     mByQ     = "By quality",
@@ -95,6 +108,11 @@ local STRINGS = {
     mReset   = "Reset position",
     mClose   = "Close window",
     tipMenu  = "Right click the frame for the menu",
+    value    = "Value",
+    bank     = "Bank",
+    mValue   = "Show bag value",
+    mBank    = "Show bank value",
+    noPriceAddon = "ItemLens is not installed — nothing to count the value with.",
   },
 }
 
@@ -108,11 +126,30 @@ end
 local function L(key) return STRINGS[CurrentLang()][key] or key end
 
 ----------------------------------------------------------------------
+-- the price addon
+----------------------------------------------------------------------
+
+-- ItemLens is the price addon. Nothing here depends on it being installed:
+-- no addon, no value line, no error.
+local function PriceApi()
+  if type(ItemLens_BagValue) == "function" then
+    return ItemLens_BagValue, ItemLens_Format
+  end
+  return nil
+end
+
+local function BankApi()
+  if type(ItemLens_BankValue) == "function" then return ItemLens_BankValue end
+  return nil
+end
+
+----------------------------------------------------------------------
 -- state
 ----------------------------------------------------------------------
 
 local frame, header, hintText, moneyText, sortButton, closeButton, offButton
 local buttons = {}      -- i -> Button
+local hoverIndex = nil  -- cell the cursor is over, for the public helpers below
 local countFS  = {}     -- i -> stack count FontString
 local bgTex    = {}     -- i -> fill acting as the border (quality colour)
 local iconTex  = {}     -- i -> item icon
@@ -294,12 +331,34 @@ local function ButtonEnter(self)
   local i = IndexOf(self)
   if not i or slotBag[i] == nil then return end
   if not GameTooltip then return end
+  hoverIndex = i
   GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
   GameTooltip:SetBagItem(slotBag[i], slotIdx[i])
   GameTooltip:Show()
 end
 
+----------------------------------------------------------------------
+-- public helpers for other addons
+----------------------------------------------------------------------
+
+-- Which bag and slot one of our cells stands for; nil for any other widget.
+function AllBags_SlotOf(widget)
+  local i = IndexOf(widget)
+  if not i then return nil end
+  if slotBag[i] == nil then return nil end
+  return slotBag[i], slotIdx[i]
+end
+
+-- The bag and slot under the cursor right now, or nil when the cursor is not
+-- over one of our cells. ItemLens uses this to know the exact stack size.
+function AllBags_MouseSlot()
+  if hoverIndex == nil then return nil end
+  if slotBag[hoverIndex] == nil then return nil end
+  return slotBag[hoverIndex], slotIdx[hoverIndex]
+end
+
 local function ButtonLeave()
+  hoverIndex = nil
   if GameTooltip then GameTooltip:Hide() end
 end
 
@@ -474,9 +533,40 @@ local function Refresh()
     i = i + 1
   end
 
-  moneyText:SetText("|cff9d9d9d" .. L("money") .. "|r " .. FormatMoney(GetMoney())
+  local footer = "|cff9d9d9d" .. L("money") .. "|r " .. FormatMoney(GetMoney())
     .. "   |cff5a5a5a|||r   |cff9d9d9d" .. L("free") .. "|r "
-    .. free .. "|cff808080/" .. slotCount .. "|r")
+    .. free .. "|cff808080/" .. slotCount .. "|r"
+
+  moneyText:SetText(footer)
+
+  -- ItemLens, when installed, knows what a vendor would pay for the contents.
+  -- The value takes the right hand corner: putting it next to the money would
+  -- run the footer into the hint on a narrow window. Nothing here depends on
+  -- ItemLens being present — no addon, no line, no error.
+  local shown = nil
+  local bagValue, money = PriceApi()
+  if AllBagsDB.value and bagValue then
+    local total, known, unknown = bagValue()
+    if type(total) == "number" then
+      shown = "|cff9d9d9d" .. L("value") .. "|r "
+        .. (money and money(total) or total)
+      if type(unknown) == "number" and unknown > 0 then
+        shown = shown .. " |cff808080+" .. unknown .. "?|r"
+      end
+
+      -- the bank, if the price addon knows it and the player wants it shown
+      local bankValue = BankApi()
+      if AllBagsDB.bank and bankValue then
+        local bankTotal, _, _, fresh = bankValue()
+        if type(bankTotal) == "number" then
+          shown = shown .. "  |cff5a5a5a|||r  |cff9d9d9d" .. L("bank") .. "|r "
+            .. (money and money(bankTotal) or bankTotal)
+          if not fresh then shown = shown .. " |cff808080*|r" end
+        end
+      end
+    end
+  end
+  hintText:SetText(shown or L("hint"))
 
   sortButton:SetText(AllBagsDB.sort == "quality" and L("sortQ") or L("sortN"))
 end
@@ -534,6 +624,15 @@ local function MenuItems()
         action = function() AllBagsDB.lang = "ru"; dirty = true end })
   add({ mark = "radio", indent = true, on = (AllBagsDB.lang == "en"), text = "English", keep = true,
         action = function() AllBagsDB.lang = "en"; dirty = true end })
+
+  if PriceApi() then
+    add({ mark = "radio", on = AllBagsDB.value, text = L("mValue"), keep = true,
+          action = function() AllBagsDB.value = not AllBagsDB.value; dirty = true end })
+    if BankApi() then
+      add({ mark = "radio", on = AllBagsDB.bank, text = L("mBank"), keep = true,
+            action = function() AllBagsDB.bank = not AllBagsDB.bank; dirty = true end })
+    end
+  end
 
   add({ mark = "none", text = L("mReset"),
         action = function()
@@ -944,7 +1043,15 @@ local function HookBagFunctions()
 
   if take("ToggleBag", ToggleBag) then
     ToggleBag = function(id)
-      if AllBagsDB.enabled then ToggleBags() else CallOriginal("ToggleBag", id) end
+      -- Only the backpack itself opens our window. The side bags and above
+      -- all the bank bags (5 to 10) must keep their own windows: clicking a
+      -- bag inside the bank used to open the combined window instead of the
+      -- bag, which made the bank unusable.
+      if AllBagsDB.enabled and (id == 0 or id == nil) then
+        ToggleBags()
+      else
+        CallOriginal("ToggleBag", id)
+      end
     end
   end
 
@@ -986,6 +1093,14 @@ local function HandleSlash(msg)
 
   elseif msg == "on" then
     SetEnabled(true)
+
+  elseif msg == "value" then
+    AllBagsDB.value = not AllBagsDB.value
+    dirty = true
+    Print(string.format(L("valueSet"), AllBagsDB.value and L("on") or L("off")))
+    if AllBagsDB.value and not PriceApi() then
+      Print("|cff808080" .. L("noPriceAddon") .. "|r")
+    end
 
   elseif msg == "sort" then
     AllBagsDB.sort = (AllBagsDB.sort == "quality") and "bag" or "quality"
