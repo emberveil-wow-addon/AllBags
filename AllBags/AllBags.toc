@@ -1,7 +1,8 @@
 ## Interface: 11200
 ## Title: AllBags
-## Notes: Все сумки в одном окне: сортировка по качеству, рамки качества, деньги и свободное место.
-## Author: Андрей
+## Notes: All bags in one window: sort by quality, quality borders, money and free space.
+## Notes-ruRU: Все сумки в одном окне: сортировка по качеству, рамки качества, деньги и свободное место.
+## Author: Vivk
 ## Version: 1.0.1
 ## SavedVariables: AllBagsDB
 
