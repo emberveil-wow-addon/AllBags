@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: AllBags
+## Notes: Все сумки в одном окне: сортировка по качеству, рамки качества, деньги и свободное место.
+## Author: Андрей
+## Version: 1.0.0
+## SavedVariables: AllBagsDB
+
+AllBags.lua
