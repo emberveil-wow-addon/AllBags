@@ -13,6 +13,7 @@
 - **Рамки качества** — необычное и выше подсвечивается цветом
 - **Полное взаимодействие** — ЛКМ взять или положить, ПКМ использовать, надеть, продать или убрать в банк, Shift и ЛКМ разделить стопку, подсказки при наведении
 - **Деньги и свободное место** в нижней строке
+- **Стоимость содержимого** — если установлен [ItemLens](https://github.com/vivk-17/ItemLens), в нижней строке видно, сколько дадут за содержимое сумок, а по желанию и за банк
 - **Кнопка отключения** возвращает штатные окна сумок, не выгружая аддон
 
 ## Как открывается
@@ -31,6 +32,7 @@
 | /bags sort | Переключить сортировку |
 | /bags cols N | Столбцов в ряду, от 4 до 20 |
 | /bags border N | Толщина окантовки окна, от 2 до 24 |
+| /bags value | Показывать стоимость содержимого |
 | /bags lang ru, en, auto | Язык |
 | /bags off, on | Отключить или включить перехват сумок |
 | /bags reset | Вернуть окно на место |
@@ -52,6 +54,7 @@ All bags in one window for the Emberveil client (WoW 1.12.1). Instead of five se
 - **Quality borders** — uncommon and above are highlighted
 - **Full interaction** — left click to pick up or drop, right click to use, equip, sell or bank, Shift and left click to split a stack, tooltips on hover
 - **Money and free space** in the footer
+- **Value of the contents** — with [ItemLens](https://github.com/vivk-17/ItemLens) installed, the footer also shows what a vendor would pay for the bags, and for the bank if you want it
 - **Disable button** brings back the default bag windows without unloading the addon
 
 ### How it opens
@@ -70,6 +73,7 @@ The addon hooks the default bag opening functions, so whatever key is already bo
 | /bags sort | Toggle sorting |
 | /bags cols N | Columns per row, 4 to 20 |
 | /bags border N | Window border thickness, 2 to 24 |
+| /bags value | Show the value of the contents |
 | /bags lang ru, en, auto | Language |
 | /bags off, on | Disable or enable the bag hooks |
 | /bags reset | Move the window back |
