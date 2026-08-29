@@ -1,10 +1,10 @@
 --[[--------------------------------------------------------------------
   AllBags 1.0.1
-  Все сумки (0-4) в одном окне. Клиент 1.12.1 / Lua 5.1 (Emberveil).
+  All bags (0-4) in one window. Client 1.12.1 / Lua 5.1 (Emberveil).
 
-  Сортировка ВИРТУАЛЬНАЯ: предметы в сумках не двигаются, меняется только
-  порядок их показа в сетке. Физическое перекладывание потребовало бы
-  десятков PickupContainerItem подряд и ломается при любой задержке сети.
+  The sort is VIRTUAL: nothing moves inside the bags, only the display order
+  in the grid changes. Moving items for real would take dozens of consecutive
+  PickupContainerItem calls and falls apart on any network hiccup.
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
@@ -14,13 +14,13 @@ local FIRST_BAG, LAST_BAG = 0, 4
 
 local SIZE, GAP, PAD = 32, 0, 4
 local HEADER, FOOTER = 26, 20
-local MIN_WIDTH = 300   -- ровно столько, сколько нужно шапке
+local MIN_WIDTH = 300   -- exactly what the header needs
 
--- Положение окна храним АБСОЛЮТНЫМИ координатами левого нижнего угла, а не
--- парой якорей. StartMoving переанкоривает фрейм по своему усмотрению, и
--- сохранённая через GetPoint пара при восстановлении могла не совпасть с
--- исходной — окно уезжало в угол экрана. x и y отсутствуют до первого
--- перетаскивания: тогда окно встаёт в правый нижний угол.
+-- The window position is stored as ABSOLUTE coordinates of the bottom left
+-- corner, not as an anchor pair. StartMoving re-anchors the frame however it
+-- likes, so a pair saved through GetPoint could differ from the original on
+-- restore and the window drifted into a screen corner. x and y are absent
+-- until the first drag: the window then sits in the bottom right corner.
 local DEFAULT_MARGIN = 20
 
 local defaults = {
@@ -28,7 +28,7 @@ local defaults = {
 }
 
 ----------------------------------------------------------------------
--- локализация
+-- localisation
 ----------------------------------------------------------------------
 
 local STRINGS = {
@@ -108,27 +108,27 @@ end
 local function L(key) return STRINGS[CurrentLang()][key] or key end
 
 ----------------------------------------------------------------------
--- состояние
+-- state
 ----------------------------------------------------------------------
 
 local frame, header, hintText, moneyText, sortButton, closeButton, offButton
 local buttons = {}      -- i -> Button
-local countFS  = {}     -- i -> FontString счётчика
-local bgTex    = {}     -- i -> заливка-рамка (цвет качества)
-local iconTex  = {}     -- i -> иконка предмета
-local innerTex = {}     -- i -> тёмная серединка пустой ячейки
-local slotBag  = {}     -- i -> идентификатор сумки
-local slotIdx  = {}     -- i -> слот в сумке
+local countFS  = {}     -- i -> stack count FontString
+local bgTex    = {}     -- i -> fill acting as the border (quality colour)
+local iconTex  = {}     -- i -> item icon
+local innerTex = {}     -- i -> dark centre of an empty cell
+local slotBag  = {}     -- i -> bag id
+local slotIdx  = {}     -- i -> slot inside that bag
 local btnIndex = {}     -- Button -> i
 local slotList = {}
 local slotCount = 0
 local dirty, timer = true, 0
 local lastCount, lastCols, lastLine = -1, -1, -1
-local ApplyPosition, SavePosition   -- предварительное объявление для меню
-local SetEnabled                    -- вкл/выкл перехвата сумок
-local ApplyBorder                   -- толщина окантовки окна
+local ApplyPosition, SavePosition   -- forward declaration for the menu
+local SetEnabled                    -- turns the bag hooks on and off
+local ApplyBorder                   -- window border thickness
 
-local GRID_R, GRID_G, GRID_B = 0.16, 0.16, 0.16   -- цвет линий сетки
+local GRID_R, GRID_G, GRID_B = 0.16, 0.16, 0.16   -- grid line colour
 
 local QUALITY_FALLBACK = {
   [0] = { 0.62, 0.62, 0.62 },
@@ -157,7 +157,7 @@ local function QualityColor(q)
   return c[1], c[2], c[3]
 end
 
--- имя предмета из гиперссылки, для устойчивой сортировки
+-- item name out of the hyperlink, for a stable sort order
 local function ItemName(bag, slot)
   local link = GetContainerItemLink(bag, slot)
   if not link then return "" end
@@ -177,7 +177,7 @@ local function FormatMoney(copper)
 end
 
 ----------------------------------------------------------------------
--- сбор и сортировка слотов
+-- collecting and sorting the slots
 ----------------------------------------------------------------------
 
 local function CollectSlots()
@@ -215,7 +215,7 @@ local function CollectSlots()
   return free, slotCount
 end
 
--- по качеству (убывание), затем по имени; пустые слоты в конец
+-- by quality (descending), then by name; empty slots go last
 local function CompareQuality(a, b)
   if a.empty ~= b.empty then return b.empty end
   if a.empty then
@@ -230,8 +230,8 @@ end
 
 local function SortSlots()
   if AllBagsDB.sort ~= "quality" then return end
-  -- своя сортировка вставками: table.sort в этом клиенте трогать не хочется,
-  -- а список короткий (до ~80 элементов)
+  -- hand written insertion sort: better not to rely on table.sort in this
+  -- client, and the list is short (up to ~80 entries)
   local i = 2
   while i <= slotCount do
     local v = slotList[i]
@@ -246,10 +246,10 @@ local function SortSlots()
 end
 
 ----------------------------------------------------------------------
--- кнопки слотов
+-- slot buttons
 ----------------------------------------------------------------------
 
--- обработчики этого клиента могут не получать self: тогда работает глобал this
+-- handlers in this client may get no self: the global this covers that case
 local function IndexOf(widget)
   if not widget then return nil end
   local i = btnIndex[widget]
@@ -303,10 +303,10 @@ local function ButtonLeave()
   if GameTooltip then GameTooltip:Hide() end
 end
 
--- Толщина линии сетки в единицах интерфейса. Значение дробное: на 1080p одна
--- единица это около 1.4 экранного пикселя, а на стыке двух ячеек их две.
--- Только целое число: дробный отступ клиент округляет по-разному в разных
--- ячейках, и линии сетки получаются неодинаковой толщины.
+-- Grid line thickness in interface units. Whole numbers only: the client
+-- rounds fractional insets differently from cell to cell and the grid lines
+-- come out uneven. One unit is about 1.4 screen pixels at 1080p, and two
+-- neighbouring cells put two of them side by side.
 local function LineWidth()
   local w = AllBagsDB and AllBagsDB.line or 1
   if type(w) ~= "number" then w = 1 end
@@ -339,20 +339,20 @@ local function GetSlotButton(i)
   b:SetHeight(SIZE)
   b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
 
-  -- Заливка во всю ячейку. Этот объект ВСЕГДА в цветовом режиме: по документации
-  -- после сплошной заливки текстура уже не принимает путь к файлу обратно.
+  -- Fill covering the whole cell. This object is ALWAYS in colour mode: per the
+  -- docs a texture will not take a file path again after a solid colour fill.
   local bg = b:CreateTexture(nil, "BACKGROUND")
   bg:SetAllPoints(b)
   bg:SetTexture(GRID_R, GRID_G, GRID_B, 1)
 
-  -- Тёмная серединка. Нужна пустым ячейкам: без неё соседние пустые сливаются
-  -- в один сплошной прямоугольник и сетка пропадает.
+  -- Dark centre. Empty cells need it: without one, neighbouring empty cells
+  -- merge into a single solid rectangle and the grid disappears.
   local inner = b:CreateTexture(nil, "BORDER")
   inner:SetTexture(0.07, 0.07, 0.07, 1)
   AnchorInset(inner, b)
 
-  -- Иконка — штатная normal-текстура кнопки, она всегда в файловом режиме.
-  -- Отступ в 1 пиксель открывает заливку по краю: это и есть линия сетки.
+  -- The icon is the button's own normal texture, always in file mode.
+  -- A one pixel inset exposes the fill along the edge: that is the grid line.
   b:SetNormalTexture("")
   local ic = b.GetNormalTexture and b:GetNormalTexture()
   b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
@@ -377,7 +377,7 @@ local function GetSlotButton(i)
 end
 
 ----------------------------------------------------------------------
--- раскладка и обновление
+-- layout and refresh
 ----------------------------------------------------------------------
 
 local function Layout()
@@ -386,7 +386,7 @@ local function Layout()
   if rows < 1 then rows = 1 end
 
   local width  = PAD * 2 + cols * SIZE + (cols - 1) * GAP
-  if width < MIN_WIDTH then width = MIN_WIDTH end   -- иначе шапка не поместится
+  if width < MIN_WIDTH then width = MIN_WIDTH end   -- or the header will not fit
   local gridW  = cols * SIZE + (cols - 1) * GAP
   local gridH  = rows * SIZE + (rows - 1) * GAP
   local gridX  = math.floor((width - gridW) / 2)
@@ -460,8 +460,8 @@ local function Refresh()
         if e.count > 1 then fs:SetText(e.count) else fs:SetText("") end
       end
       if bg then
-        -- обычное и мусорное качество красим в цвет сетки: иначе стык двух
-        -- ячеек даёт яркую полосу в два пикселя и рамки выглядят толстыми
+        -- common and poor quality take the grid colour: otherwise the seam
+        -- between two cells is a bright two pixel band and looks thick
         if e.quality and e.quality <= 1 then
           bg:SetTexture(GRID_R, GRID_G, GRID_B, 1)
         else
@@ -482,7 +482,7 @@ local function Refresh()
 end
 
 ----------------------------------------------------------------------
--- контекстное меню (ПКМ по рамке окна)
+-- context menu (right click on the window frame)
 ----------------------------------------------------------------------
 
 local menu, menuTitle
@@ -497,7 +497,7 @@ local function LeaveMenu() hoverCount = hoverCount - 1; if hoverCount < 0 then h
 
 local function HideMenu() if menu then menu:Hide() end end
 
-local ShowMenu   -- предварительное объявление: пункты меню перерисовывают его
+local ShowMenu   -- forward declaration: menu entries redraw the menu
 
 local function MenuItems()
   local items, count = {}, 0
@@ -674,7 +674,7 @@ local function ToggleMenu()
 end
 
 ----------------------------------------------------------------------
--- окно
+-- window
 ----------------------------------------------------------------------
 
 ApplyBorder = function()
@@ -692,7 +692,7 @@ ApplyBorder = function()
     tileSize = 16, edgeSize = e,
     insets   = { left = inset, right = inset, top = inset, bottom = inset },
   })
-  -- SetBackdrop сбрасывает цвета, поэтому задаём их заново
+  -- SetBackdrop resets the colours, so set them again
   frame:SetBackdropColor(0, 0, 0, 0.9)
   frame:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 end
@@ -717,8 +717,8 @@ SavePosition = function()
 
   AllBagsDB.x, AllBagsDB.y = left, bottom
 
-  -- сразу приводим якорь к тому же виду, в котором будем восстанавливать:
-  -- дальше окно растёт вверх при смене числа рядов, а низ остаётся на месте
+  -- normalise the anchor to the same form used on restore: the window then
+  -- grows upwards when the row count changes and the bottom edge stays put
   frame:ClearAllPoints()
   frame:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left, bottom)
 end
@@ -854,7 +854,7 @@ local function BuildFrame()
 end
 
 ----------------------------------------------------------------------
--- показ / скрытие и перехват штатных функций сумок
+-- show / hide and hooks over the default bag functions
 ----------------------------------------------------------------------
 
 local orig = {}
@@ -882,9 +882,9 @@ local function ToggleBags()
   if frame:IsShown() then HideBags() else ShowBags() end
 end
 
--- Клавиша сумок (по умолчанию B) вызывает функции FrameXML, а не игровой API.
--- Перехватываем их, если они есть: тогда любая привязанная клавиша, клик по
--- кнопке сумки и автооткрытие у торговца ведут в это окно.
+-- The bag key (B by default) calls FrameXML functions, not the game API.
+-- Hook them when present: whatever key is bound, a click on a bag button and
+-- the merchant auto-open then all lead into this window.
 local function CallOriginal(name, a1)
   local o = orig[name]
   if not o then return end
@@ -909,9 +909,9 @@ SetEnabled = function(on)
 end
 
 local function HookBagFunctions()
-  -- Вызывается и на VARIABLES_LOADED, и на PLAYER_LOGIN. Без этого замка второй
-  -- проход сохранял бы в orig уже подменённую функцию — и она звала бы сама себя
-  -- до переполнения стека.
+  -- Called on both VARIABLES_LOADED and PLAYER_LOGIN. Without this latch the
+  -- second pass would store the already hooked function into orig, and it would
+  -- then call itself until the stack overflows.
   if hooksDone then return hookedCount end
   hooksDone = true
 
@@ -967,7 +967,7 @@ local function HookBagFunctions()
 end
 
 ----------------------------------------------------------------------
--- команды
+-- slash commands
 ----------------------------------------------------------------------
 
 local function HandleSlash(msg)
@@ -1040,7 +1040,7 @@ local function HandleSlash(msg)
 end
 
 ----------------------------------------------------------------------
--- события
+-- events
 ----------------------------------------------------------------------
 
 local function InitDB()
