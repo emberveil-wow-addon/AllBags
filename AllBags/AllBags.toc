@@ -1,9 +1,10 @@
 ## Interface: 11200
 ## Title: AllBags
-## Notes: All bags in one window: sort by quality, quality borders, money and free space.
-## Notes-ruRU: Все сумки в одном окне: сортировка по качеству, рамки качества, деньги и свободное место.
+## Notes: All bags in one window: sorting, favourites, and a vault view of other characters' bags, bank and gear.
+## Notes-ruRU: Все сумки в одном окне: сортировка, избранное и просмотр сумок, банка и экипировки других персонажей.
 ## Author: Vivk
-## Version: 1.1.0
-## SavedVariables: AllBagsDB
+## Version: 1.2.0
+## SavedVariables: AllBagsDB, AllBagsVault
 
 AllBags.lua
+AllBagsVault.lua

@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------
-  AllBags 1.1.0
+  AllBags 1.2.0
   All bags (0-4) in one window. Client 1.12.1 / Lua 5.1 (Emberveil).
 
   The sort is VIRTUAL: nothing moves inside the bags, only the display order
@@ -8,7 +8,7 @@
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 
 local FIRST_BAG, LAST_BAG = 0, 4
 
@@ -96,7 +96,7 @@ local STRINGS = {
     msgOn    = "аддон включён, сумки открываются общим окном.",
     colsSet  = "столбцов: %d",
     colsErr  = "укажите число от 4 до 20, например: /bags cols 10",
-    help     = "команды: /bags [config | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
+    help     = "команды: /bags [config | vault | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
     reset    = "позиция сброшена.",
     valueSet = "стоимость сумок: %s",
     on       = "вкл",
@@ -118,6 +118,8 @@ local STRINGS = {
     noPriceAddon = "ItemLens не установлен — считать стоимость нечем.",
     loaded   = "%s загружен. ПКМ по рамке — меню, /bags config — настройки.",
     mCfg     = "Настройки",
+    mVault   = "Другие персонажи...",
+    mAlts    = "Альты",
     cfgTitle = "AllBags — настройки",
     cfgSort  = "Порядок сортировки",
     cfgHint  = "сверху — главное условие; стрелки двигают, квадрат включает",
@@ -160,7 +162,7 @@ local STRINGS = {
     msgOn    = "addon enabled, bags open in the combined window.",
     colsSet  = "columns: %d",
     colsErr  = "give a number from 4 to 20, for example: /bags cols 10",
-    help     = "commands: /bags [config | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
+    help     = "commands: /bags [config | vault | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
     reset    = "position reset.",
     valueSet = "bag value: %s",
     on       = "on",
@@ -182,6 +184,8 @@ local STRINGS = {
     noPriceAddon = "ItemLens is not installed — nothing to count the value with.",
     loaded   = "%s loaded. Right click the frame for the menu, /bags config for settings.",
     mCfg     = "Settings",
+    mVault   = "Other characters...",
+    mAlts    = "Alts",
     cfgTitle = "AllBags — settings",
     cfgSort  = "Sort order",
     cfgHint  = "top line matters most; arrows move, the box switches on and off",
@@ -985,6 +989,13 @@ local function MenuItems()
   add({ mark = "radio", indent = true, on = (AllBagsDB.sort ~= "quality"), text = L("mByBag"), keep = true,
         action = function() AllBagsDB.sort = "bag"; dirty = true end })
 
+  -- the vault lives in its own file; the entry only appears when that file
+  -- is there, so the menu never points at nothing
+  if type(AllBagsVault_Toggle) == "function" then
+    add({ mark = "none", text = L("mVault"),
+          action = function() AllBagsVault_Toggle() end })
+  end
+
   add({ mark = "none", text = L("mCols") .. ":", header = true })
   local i = 1
   while COL_CHOICES[i] do
@@ -1270,6 +1281,52 @@ ApplyBorder = function()
   frame:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 end
 
+-- Other characters. The button sits by the title, not by the close cross: a
+-- header button in that corner is one miss away from closing the window,
+-- which is why the old settings button had to go. It appears only when
+-- AllBagsVault.lua is loaded, so it never points at nothing - and it cannot
+-- be built inside BuildFrame, which runs before that file is loaded.
+local vaultButton
+local function AddVaultButton()
+  if vaultButton or not frame then return end
+  if type(AllBagsVault_Toggle) ~= "function" then return end
+
+  local vb = CreateFrame("Button", "AllBagsVaultOpen", frame)
+  vaultButton = vb
+  -- Not by the title: the sort switch is centred and 150 wide, so on a narrow
+  -- window it walks right over that spot. Anchored to the right edge instead,
+  -- with a gap the close cross cannot be missed into.
+  vb:SetWidth(44)
+  vb:SetHeight(17)
+  vb:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6)
+
+  -- An icon here came out invisible: this client has no such file, and a
+  -- missing texture draws nothing at all rather than complaining. A framed
+  -- word always renders, so that is what the button is.
+  vb:SetFont("Fonts\\FRIZQT__.TTF", 11)
+  vb:SetText(L("mAlts"))
+  vb:SetTextColor(1, 0.82, 0)
+  vb:SetBackdrop({
+    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tileSize = 16, edgeSize = 10,
+    insets   = { left = 2, right = 2, top = 2, bottom = 2 },
+  })
+  vb:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+  vb:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
+
+  vb:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  vb:SetScript("OnClick", function() AllBagsVault_Toggle() end)
+  vb:SetScript("OnEnter", function()
+    if not GameTooltip then return end
+    GameTooltip:SetOwner(this or vb, "ANCHOR_BOTTOMRIGHT")
+    GameTooltip:AddLine(L("mVault"), 1, 0.82, 0)
+    GameTooltip:AddLine("/bags vault", 0.6, 0.6, 0.6)
+    GameTooltip:Show()
+  end)
+  vb:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+end
+
 ApplyPosition = function()
   if not frame then return end
   frame:ClearAllPoints()
@@ -1369,6 +1426,7 @@ local function BuildFrame()
   closeButton:SetTextColor(1, 0.35, 0.35)
   closeButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
   closeButton:SetScript("OnClick", function() frame:Hide() end)
+
 
   -- A settings button used to sit here between the sort switch and the close
   -- cross. It crowded a header that is only 300 wide: settings live on the
@@ -1984,6 +2042,15 @@ local function HandleSlash(msg)
   elseif msg == "types" then
     ShowTypes()
 
+  elseif msg == "vault" or msg == "vault probe" or msg == "chars" then
+    if type(AllBagsVault_Toggle) ~= "function" then
+      Print("AllBagsVault.lua не загружен")
+    elseif msg == "vault probe" then
+      AllBagsVault_Probe()
+    else
+      AllBagsVault_Toggle()
+    end
+
   elseif msg == "font" then
     -- what the client really put on a stack figure, for when a size looks wrong
     local fs = countFS[1]
@@ -2154,6 +2221,7 @@ local function OnEvent(self, ev)
     ApplyBorder()
     ApplyPosition()
     HookBagFunctions()
+    AddVaultButton()
     if not greeted then
       greeted = true
       Print(string.format(L("loaded"), ADDON .. " " .. VERSION))
