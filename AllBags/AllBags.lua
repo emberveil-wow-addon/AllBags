@@ -1,5 +1,5 @@
 --[[--------------------------------------------------------------------
-  AllBags 1.2.0
+  AllBags 1.3.8
   All bags (0-4) in one window. Client 1.12.1 / Lua 5.1 (Emberveil).
 
   The sort is VIRTUAL: nothing moves inside the bags, only the display order
@@ -8,11 +8,19 @@
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
-local VERSION = "1.2.0"
+local VERSION = "1.3.0"
 
 local FIRST_BAG, LAST_BAG = 0, 4
 
+-- GAP and PAD are set by ApplyMetrics: both depend on which style of frame
+-- and which style of slot the player picked.
 local SIZE, GAP, PAD = 32, 0, 4
+-- 0 means "exactly what the client does": the whole 64 pixel picture drawn
+-- at 64 pixels on a 37 pixel cell, so the hole in the art is the cell and
+-- the metal hangs outside it. A value above 0 crops the picture to its inner
+-- frame and draws it at cell size instead - a tighter grid, no overhang.
+local RING_CROP = 0
+local STOCK_GAP = 4
 local HEADER, FOOTER = 26, 20
 local MIN_WIDTH = 300   -- exactly what the header needs
 
@@ -25,6 +33,8 @@ local DEFAULT_MARGIN = 20
 
 local defaults = {
   cols = 10, sort = "quality", lang = "auto", enabled = true, line = 1, border = 6,
+  frameStyle = "dialog",   -- "dialog" for the stock carved edge, "tooltip" for the thin one
+  slotStyle  = "stock",    -- "stock" for Blizzard's container buttons, "plain" for our grid
   value = true,     -- show what the bags are worth, when the price addon is there
   bank = false,     -- and what the bank held, when it knows that too
   csize = 14,       -- stack figures: the client's own are too small to read
@@ -81,8 +91,15 @@ local STRINGS = {
     title    = "Сумки",
     free     = "Место",
     money    = "Деньги",
-    sortQ    = "Сортировка: по качеству",
-    sortN    = "Сортировка: по сумкам",
+    cfgFrame = "Рамка окна",
+    cfgSlot  = "Ячейки",
+    slStock  = "штатные",
+    bedFlat  = "ровный тёмный",
+    slPlain  = "простые",
+    frDialog = "штатная",
+    frTip    = "простая",
+    sortQ    = "По качеству",
+    sortN    = "По сумкам",
     hint     = "ПКМ по рамке — меню",
     hintFull = "ЛКМ взять · ПКМ использовать · Shift+ЛКМ разделить",
     btnOff   = "Откл.",
@@ -96,7 +113,7 @@ local STRINGS = {
     msgOn    = "аддон включён, сумки открываются общим окном.",
     colsSet  = "столбцов: %d",
     colsErr  = "укажите число от 4 до 20, например: /bags cols 10",
-    help     = "команды: /bags [config | vault | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
+    help     = "команды: /bags [config | vault | types | fav | menu | sort | cols N | value | hover | lang ru/en/auto | on | off | reset]. Внешний вид: frame, slots",
     reset    = "позиция сброшена.",
     valueSet = "стоимость сумок: %s",
     on       = "вкл",
@@ -120,6 +137,7 @@ local STRINGS = {
     mCfg     = "Настройки",
     mVault   = "Другие персонажи...",
     mAlts    = "Альты",
+    cfgOpen  = "Настройки",
     cfgTitle = "AllBags — настройки",
     cfgSort  = "Порядок сортировки",
     cfgHint  = "сверху — главное условие; стрелки двигают, квадрат включает",
@@ -147,8 +165,15 @@ local STRINGS = {
     title    = "Bags",
     free     = "Free",
     money    = "Money",
-    sortQ    = "Sort: by quality",
-    sortN    = "Sort: by bag",
+    cfgFrame = "Window frame",
+    cfgSlot  = "Slots",
+    slStock  = "stock",
+    bedFlat  = "flat dark",
+    slPlain  = "plain",
+    frDialog = "stock",
+    frTip    = "plain",
+    sortQ    = "By quality",
+    sortN    = "By bag",
     hint     = "Right click the frame for the menu",
     hintFull = "LMB take · RMB use · Shift+LMB split",
     btnOff   = "Off",
@@ -162,7 +187,7 @@ local STRINGS = {
     msgOn    = "addon enabled, bags open in the combined window.",
     colsSet  = "columns: %d",
     colsErr  = "give a number from 4 to 20, for example: /bags cols 10",
-    help     = "commands: /bags [config | vault | types | fav | menu | sort | cols N | border N | value | lang ru/en/auto | on | off | reset]",
+    help     = "commands: /bags [config | vault | types | fav | menu | sort | cols N | value | hover | lang ru/en/auto | on | off | reset]. Looks: frame, slots",
     reset    = "position reset.",
     valueSet = "bag value: %s",
     on       = "on",
@@ -186,6 +211,7 @@ local STRINGS = {
     mCfg     = "Settings",
     mVault   = "Other characters...",
     mAlts    = "Alts",
+    cfgOpen  = "Settings",
     cfgTitle = "AllBags — settings",
     cfgSort  = "Sort order",
     cfgHint  = "top line matters most; arrows move, the box switches on and off",
@@ -243,9 +269,39 @@ end
 ----------------------------------------------------------------------
 
 local frame, header, hintText, moneyText, sortButton, closeButton
+local cfgButton
+local coin, freeText
+local valStrip, bankStrip
+local vaultButton, AnchorChrome
+-- One footer line, or two. Coins are wider than "6g 44s 63c" ever was, so on
+-- a ten column window the money ran straight into the value on the right.
+-- The value moves up a line instead of overlapping, and the window grows by
+-- that line only while there is a value to show.
+local footerRows = 1
+-- Whether each slot is one of Blizzard's own container buttons. The two kinds
+-- are drawn differently: the stock one carries the slot art as its normal
+-- texture and the item picture in a texture of its own, ours puts the item
+-- picture ON the normal texture and paints the cell behind it.
+local stockSlot = {}
+
+-- Probed on this client (UiProbe 0.1.1): this atlas draws, and its four
+-- quarters are gold, silver, copper and an empty one.
+local MONEY_ATLAS = "Interface\\MoneyFrame\\UI-MoneyIcons"
+local COIN = 14
+
+-- Blizzard's own widget templates. Also probed: all four exist here, and a
+-- caption on a templated button draws - which a caption on a bare button
+-- does not, because a bare button has no FontString to write into.
+local TMPL_BTN   = "UIPanelButtonTemplate"
+local TMPL_CHECK = "UICheckButtonTemplate"
+local TMPL_CLOSE = "UIPanelCloseButton"
+local TMPL_SLIDER = "OptionsSliderTemplate"
 local buttons = {}      -- i -> Button
 local hoverIndex = nil  -- cell the cursor is over, for the public helpers below
 local countFS  = {}     -- i -> stack count FontString
+-- What the last hover worked out, for /bags hover: an empty tooltip cannot be
+-- diagnosed from a screenshot.
+local lastHover = ""
 local bgTex    = {}     -- i -> fill acting as the border (quality colour)
 local starTex  = {}     -- i -> favourite mark in the corner
 local iconTex  = {}     -- i -> item icon
@@ -262,6 +318,8 @@ local lastMode, lastCSize = -1, -1
 local ApplyPosition, SavePosition   -- forward declaration for the menu
 local SetEnabled                    -- turns the bag hooks on and off
 local ApplyBorder                   -- window border thickness
+local Dialog, ApplyMetrics, FootY    -- assigned below, used from Refresh above
+local StockSlots
 local ApplyCountFont, ApplyCountSize  -- size of the stack figures
 local ShowConfig                    -- settings window, built on first use
 local ShowTypes                     -- the type order window, same idea
@@ -351,6 +409,28 @@ local function ItemType(bag, slot)
   return ""
 end
 
+-- A template this client might not have should not take the window down
+-- with it, so every one of them is tried and the plain build is the fallback.
+local function Templated(kind, name, parent, template)
+  local made
+  local ok = pcall(function() made = CreateFrame(kind, name, parent, template) end)
+  if ok and made then return made end
+  return nil
+end
+
+local function TextW(fs)
+  if not fs then return 0 end
+  local t = fs.GetText and fs:GetText()
+  if not t or t == "" then return 0 end
+  if fs.GetStringWidth then
+    local ok, got = pcall(function() return fs:GetStringWidth() end)
+    if ok and type(got) == "number" and got > 0 then return got end
+  end
+  local plain = string.gsub(t, "|c%x%x%x%x%x%x%x%x", "")
+  plain = string.gsub(plain, "|r", "")
+  return string.len(plain) * 5
+end
+
 local function FormatMoney(copper)
   copper = copper or 0
   local g = math.floor(copper / 10000)
@@ -370,6 +450,156 @@ end
 -- addon writes down every class it meets and the player arranges that list in
 -- the type window. A class nobody has arranged yet lands after the known ones.
 local typeRank = {}
+
+-- Money as coin icons, laid out left to right, the way the game does it.
+-- The higher denominations disappear when they are zero: "0g 0s 30c" is
+-- three lies about how rich you are.
+local function DrawMoney(copper, tail)
+  if not coin or not moneyText then return end
+  copper = copper or 0
+  local g = math.floor(copper / 10000)
+  local s = math.floor(copper / 100) - g * 100
+  local c = copper - math.floor(copper / 100) * 100
+  local val = { g, s, c }
+  local show = { g > 0, (g > 0 or s > 0), true }
+
+  -- the purse lives on the upper of the two footer lines
+  local base = FootY() + 18
+  local x = PAD + 2
+  moneyText:ClearAllPoints()
+  moneyText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", x, base)
+  x = x + TextW(moneyText) + 7
+
+  local k = 1
+  while k <= 3 do
+    local ci = coin[k]
+    if show[k] then
+      ci.num:SetText(val[k])
+      ci.num:ClearAllPoints()
+      ci.num:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", x, base)
+      ci.num:Show()
+      x = x + TextW(ci.num) + 1
+
+      ci.icon:ClearAllPoints()
+      ci.icon:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", x, base - 1)
+      ci.icon:Show()
+      x = x + COIN + 6
+    else
+      ci.icon:Hide()
+      ci.num:Hide()
+    end
+    k = k + 1
+  end
+
+  -- the tail is drawn by Refresh on the lower line now; DrawMoney only ever
+  -- gets an empty one, and an empty FontString takes no room anyway
+  if tail and tail ~= "" then
+    freeText:ClearAllPoints()
+    freeText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", x, base)
+    freeText:SetText(tail)
+  end
+end
+
+-- A run of "label 7(gold) 51(silver) 30(copper)" laid out by hand. The
+-- client has no way to put a picture inside a line of text: the |T...|t
+-- escape that vanilla uses for exactly this came out as raw characters when
+-- probed (UiProbe 0.1.6), so every coin has to be a texture of its own,
+-- anchored next to a number of its own. That is what a strip is.
+local function CoinSplit(copper)
+  copper = copper or 0
+  local g = math.floor(copper / 10000)
+  local s = math.floor(copper / 100) - g * 100
+  local c = copper - math.floor(copper / 100) * 100
+  return { g, s, c }, { g > 0, (g > 0 or s > 0), true }
+end
+
+local function NewStrip(parent, size)
+  local st = { num = {}, icon = {} }
+  st.label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  pcall(function() st.label:SetFont("Fonts\\FRIZQT__.TTF", size, "") end)
+  st.label:SetJustifyH("LEFT")
+  st.label:Hide()
+  local k = 1
+  while k <= 3 do
+    local ic = parent:CreateTexture(nil, "OVERLAY")
+    ic:SetWidth(COIN)
+    ic:SetHeight(COIN)
+    ic:SetTexture(MONEY_ATLAS)
+    ic:SetTexCoord((k - 1) * 0.25, k * 0.25, 0, 1)
+    ic:Hide()
+    local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    pcall(function() fs:SetFont("Fonts\\FRIZQT__.TTF", size, "") end)
+    fs:SetJustifyH("LEFT")
+    fs:Hide()
+    st.icon[k], st.num[k] = ic, fs
+    k = k + 1
+  end
+  return st
+end
+
+local function StripHide(st)
+  if not st then return end
+  st.label:Hide()
+  local k = 1
+  while k <= 3 do
+    st.icon[k]:Hide()
+    st.num[k]:Hide()
+    k = k + 1
+  end
+end
+
+-- how wide the strip will be once it says this. Measured, never assumed:
+-- guessing a text width has been wrong four times in this addon already.
+local function StripWidth(st, label, copper)
+  st.label:SetText(label or "")
+  local w = TextW(st.label)
+  if w > 0 then w = w + 6 end
+  local val, show = CoinSplit(copper)
+  local k = 1
+  while k <= 3 do
+    if show[k] then
+      st.num[k]:SetText(val[k])
+      w = w + TextW(st.num[k]) + 1 + COIN + 6
+    end
+    k = k + 1
+  end
+  return w
+end
+
+-- places it, left to right, and answers where the next thing may start
+local function StripPlace(st, parent, label, copper, x, y)
+  st.label:SetText(label or "")
+  st.label:ClearAllPoints()
+  st.label:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x, y)
+  if TextW(st.label) > 0 then
+    st.label:Show()
+    x = x + TextW(st.label) + 6
+  else
+    st.label:Hide()
+  end
+
+  local val, show = CoinSplit(copper)
+  local k = 1
+  while k <= 3 do
+    if show[k] then
+      st.num[k]:SetText(val[k])
+      st.num[k]:ClearAllPoints()
+      st.num[k]:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x, y)
+      st.num[k]:Show()
+      x = x + TextW(st.num[k]) + 1
+
+      st.icon[k]:ClearAllPoints()
+      st.icon[k]:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x, y - 1)
+      st.icon[k]:Show()
+      x = x + COIN + 6
+    else
+      st.num[k]:Hide()
+      st.icon[k]:Hide()
+    end
+    k = k + 1
+  end
+  return x
+end
 
 local function NoteType(t)
   if not t or t == "" then return end
@@ -594,12 +824,40 @@ end
 local function ButtonEnter(self)
   self = self or this
   local i = IndexOf(self)
-  if not i or slotBag[i] == nil then return end
+  if not i or slotBag[i] == nil then
+    lastHover = "index=" .. tostring(i) .. " (nothing behind that cell)"
+    if GameTooltip then GameTooltip:Hide() end
+    return
+  end
   if not GameTooltip then return end
   hoverIndex = i
-  GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+
+  -- A window pinned to the right edge pushes an ANCHOR_RIGHT tooltip off the
+  -- screen, and this client clamps it back as a panel instead of flipping it
+  -- to the other side. So the side is picked from where the cell really is.
+  local anchor = "ANCHOR_RIGHT"
+  local left = self.GetLeft and self:GetLeft()
+  local wide = UIParent and UIParent.GetWidth and UIParent:GetWidth()
+  if left and wide and wide > 0 and left > wide * 0.55 then
+    anchor = "ANCHOR_LEFT"
+  end
+
+  GameTooltip:SetOwner(self, anchor)
   GameTooltip:SetBagItem(slotBag[i], slotIdx[i])
-  GameTooltip:Show()
+
+  -- An owner with nothing put into it draws here as an empty box, so the
+  -- tooltip is shown only once the client has actually filled it.
+  local lines = 0
+  if GameTooltip.NumLines then
+    local ok, got = pcall(function() return GameTooltip:NumLines() end)
+    if ok and type(got) == "number" then lines = got end
+  end
+
+  lastHover = string.format("index=%s bag=%s slot=%s anchor=%s lines=%s",
+    tostring(i), tostring(slotBag[i]), tostring(slotIdx[i]), anchor,
+    tostring(lines))
+
+  if lines > 0 then GameTooltip:Show() else GameTooltip:Hide() end
 end
 
 ----------------------------------------------------------------------
@@ -607,6 +865,9 @@ end
 ----------------------------------------------------------------------
 
 -- Which bag and slot one of our cells stands for; nil for any other widget.
+-- for the stand: the border is applied from places the tests cannot reach
+function AllBags_ApplyBorder() if ApplyBorder then ApplyBorder() end end
+
 function AllBags_SlotOf(widget)
   local i = IndexOf(widget)
   if not i then return nil end
@@ -691,10 +952,174 @@ ApplyCountSize = function()
   while countFS[i] do ApplyCountFont(i); i = i + 1 end
 end
 
+-- The slot picture, in the client's own proportions. Asked the game's own
+-- bag window directly (UiProbe 0.1.3, reading ContainerFrame1Item1):
+--
+--   file=Interface\\Buttons\\UI-Quickslot2  size=64x64  CENTER (0,1)  texcoord=nil
+--
+-- So the picture is 64 pixels on a 37 pixel cell and is NOT cropped: the
+-- second frame we kept seeing is the outer metal, which in the game hangs
+-- over the gap between cells instead of being squeezed inside one. The
+-- earlier 37x37 reading came from a templated button of our own, which
+-- never got the size the container gives its children.
+-- The bed an empty cell shows. In the game's own bags that is the brown hide
+-- of the bag itself, and the client will not simply hand it over: GetTexture
+-- answers for files that do not exist, GetNumRegions says 0 for a window
+-- that plainly has art, and GetTexCoord returns nothing at all in this
+-- build. What the game's own bag DID admit, asked by name (/up bag):
+--
+--   ContainerFrame1BackgroundMiddle1: UI-Bag-Components 256x512 TOP crop=nil
+--   ContainerFrame1BackgroundMiddle2: UI-Bag-Components 256x256 TOP crop=nil
+--   ContainerFrame1BackgroundBottom:  UI-Bag-Components 256x10  TOP crop=nil
+--
+-- So the whole sheet is drawn uncropped at three sizes, stacked from the top:
+-- the holes are painted into the art for a four-column window, which is why
+-- no arrangement of it fits a ten-column grid. What we can take from it is a
+-- patch of plain hide. The six below were measured off the magnified sheet
+-- (UiProbe 0.1.5, /up atlas) by finding the largest squares that carry no
+-- metal at all: 1 and 2 are the light hide of the header strip, 3 to 6 are
+-- the darker hide from inside the slot holes.
+local BED_FILE = "Interface\\ContainerFrame\\UI-Bag-Components"
+local BED_SPOTS = {
+  { 0.4241, 0.4963, 0.2537, 0.3259 },
+  { 0.5333, 0.6037, 0.2519, 0.3222 },
+  { 0.5130, 0.5759, 0.4333, 0.4963 },
+  { 0.5370, 0.6000, 0.7537, 0.8167 },
+  { 0.3815, 0.4426, 0.4352, 0.4963 },
+  { 0.5370, 0.5981, 0.5148, 0.5759 },
+}
+-- 3 is the one that came closest to the game's own empty cell by eye; none
+-- of the six is exact, because the hide in the sheet is painted for a
+-- four-column window and is lit from above, so any patch of it is a little
+-- lighter or darker than the spot the game happens to show. bedShade is the
+-- knob for that last bit: it multiplies the patch, so /bags bed 3 0.9 makes
+-- the same hide darker without touching its grain.
+local bedSpot, bedShade = 3, 1
+
+local function ApplyBed(t)
+  if not t then return end
+  local sp = BED_SPOTS[bedSpot]
+  if sp then
+    t:SetTexture(BED_FILE)
+    if t.SetTexCoord then
+      pcall(function() t:SetTexCoord(sp[1], sp[2], sp[3], sp[4]) end)
+    end
+    if t.SetVertexColor then
+      pcall(function() t:SetVertexColor(bedShade, bedShade, bedShade) end)
+    end
+  else
+    if t.SetTexCoord then pcall(function() t:SetTexCoord(0, 1, 0, 1) end) end
+    if t.SetVertexColor then
+      pcall(function() t:SetVertexColor(1, 1, 1) end)
+    end
+    -- not black: an empty cell in the game reads as dark hide, and flat
+    -- black next to the stock bag looks like a hole cut in the window
+    t:SetTexture(0.11, 0.08, 0.06, 1)
+  end
+end
+
+local function ApplyRing(t)
+  if not t then return end
+  if RING_CROP > 0 then
+    t:SetWidth(SIZE)
+    t:SetHeight(SIZE)
+    if t.SetTexCoord then
+      pcall(function()
+        t:SetTexCoord(RING_CROP, 1 - RING_CROP, RING_CROP, 1 - RING_CROP)
+      end)
+    end
+  else
+    t:SetWidth(64)
+    t:SetHeight(64)
+    if t.SetTexCoord then pcall(function() t:SetTexCoord(0, 1, 0, 1) end) end
+  end
+end
+
 local function GetSlotButton(i)
   if buttons[i] then return buttons[i] end
 
-  local b = CreateFrame("Button", "AllBagsSlot" .. i, frame)
+  local name = "AllBagsSlot" .. i
+
+  -- The stock look, built by hand and NOT from
+  -- ContainerFrameItemButtonTemplate. The template was tried first and its
+  -- art was right, but on this client its own OnEnter runs as well as ours
+  -- and wipes the tooltip we had just filled: /bags hover showed our fill
+  -- putting 8 lines in and the box still coming up empty, with the owner
+  -- reported as nil. Drawing the same three pieces ourselves keeps the look
+  -- and leaves nobody else holding a script on the button.
+  if StockSlots() then
+    local sb = CreateFrame("Button", name, frame)
+    stockSlot[i] = true
+    sb:SetWidth(SIZE)
+    sb:SetHeight(SIZE)
+    sb:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+    sb:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    sb:SetScript("OnClick", ButtonClick)
+    sb:SetScript("OnEnter", ButtonEnter)
+    sb:SetScript("OnLeave", ButtonLeave)
+
+    -- A flat colour behind everything, so a cell is never a hole in the
+    -- window even if a file is missing. The client's own cell has no such
+    -- layer, and no UI-Slot-Background either: putting one under the ring is
+    -- what gave every empty cell two contours, because the two files do not
+    -- keep their art in the same place.
+    local fill = sb:CreateTexture(nil, "BACKGROUND")
+    fill:SetAllPoints(sb)
+    ApplyBed(fill)
+
+    -- the whole cell, no inset: that is what the client's own icon does
+    local icon = sb:CreateTexture(nil, "ARTWORK")
+    icon:SetPoint("TOPLEFT", sb, "TOPLEFT", 0, 0)
+    icon:SetWidth(SIZE)
+    icon:SetHeight(SIZE)
+    icon:Hide()
+
+    -- Blizzard's own slot ring, and in Blizzard's own proportions. Their
+    -- ItemButtonTemplate is a 37 pixel button carrying a 64 pixel
+    -- UI-Quickslot2 centred on it, one pixel low: the hole in the art is
+    -- exactly the button, and the metal hangs outside it. Squeezing the same
+    -- art into 32 pixels - which is what the first attempt did - turns the
+    -- ring into a thin dotted line, and that is why the cells did not look
+    -- like the game's own.
+    -- Asked the client itself (UiProbe 0.1.2) how its own item button is
+    -- built, instead of trusting vanilla's documentation, which was wrong
+    -- about this build three times running. Its answer:
+    --
+    --   normal: Interface/Buttons/UI-Quickslot2  37x37  CENTER/CENTER (0,1)
+    --   icon:   37x37  TOPLEFT/TOPLEFT (0,0)
+    --   cell:   37x37
+    --
+    -- So the ring is the SAME size as the cell, not 64 for a 37 cell, and it
+    -- sits one pixel HIGH, not one low. Those are the numbers below.
+    local ring = sb:CreateTexture(nil, "OVERLAY")
+    ring:SetTexture("Interface\\Buttons\\UI-Quickslot2")
+    ring:SetPoint("CENTER", sb, "CENTER", 0, 1)
+    ApplyRing(ring)
+
+    local fs = sb:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    fs:SetPoint("BOTTOMRIGHT", sb, "BOTTOMRIGHT", -3, 3)
+    fs:SetJustifyH("RIGHT")
+
+    local star = sb:CreateTexture(nil, "OVERLAY")
+    star:SetTexture(1, 0.82, 0, 1)
+    star:SetWidth(6)
+    star:SetHeight(6)
+    star:SetPoint("TOPLEFT", sb, "TOPLEFT", 4, -4)
+    star:Hide()
+
+    buttons[i]   = sb
+    countFS[i]   = fs
+    iconTex[i]   = icon
+    bgTex[i]     = ring        -- tinted for quality
+    innerTex[i]  = fill
+    starTex[i]   = star
+    btnIndex[sb] = i
+    ApplyCountFont(i)
+    return sb
+  end
+
+  local b = CreateFrame("Button", name, frame)
+  stockSlot[i] = false
   b:SetWidth(SIZE)
   b:SetHeight(SIZE)
   b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
@@ -836,6 +1261,7 @@ local function Layout()
 
   frame:SetWidth(width)
   frame:SetHeight(y + 6 + FOOTER)
+  AnchorChrome()
 
   local j = slotCount + 1
   while buttons[j] do
@@ -871,8 +1297,10 @@ local function Refresh()
     lastLine = AllBagsDB.line
     local k = 1
     while buttons[k] do
-      AnchorInset(innerTex[k], buttons[k])
-      AnchorInset(iconTex[k], buttons[k])
+      if not stockSlot[k] then
+        AnchorInset(innerTex[k], buttons[k])
+        AnchorInset(iconTex[k], buttons[k])
+      end
       k = k + 1
     end
   end
@@ -884,6 +1312,7 @@ local function Refresh()
     local fs = countFS[i]
     local bg    = bgTex[i]
     local inner = innerTex[i]
+    local icon  = iconTex[i]
     slotBag[i], slotIdx[i] = e.bag, e.slot
 
     local star = starTex[i]
@@ -891,23 +1320,54 @@ local function Refresh()
       if e.fav and not e.empty then star:Show() else star:Hide() end
     end
 
+    local stock = stockSlot[i]
+
     if e.empty then
-      b:SetNormalTexture("")
-      if inner then inner:Show() end
-      if bg then bg:SetTexture(GRID_R, GRID_G, GRID_B, 1) end
+      if stock then
+        -- the ring and the dark bed stay: an empty slot is meant to look
+        -- like one, it is only the picture that goes
+        if icon then icon:Hide() end
+        if bg and bg.SetVertexColor then bg:SetVertexColor(1, 1, 1) end
+      else
+        b:SetNormalTexture("")
+        if inner then inner:Show() end
+        if bg then bg:SetTexture(GRID_R, GRID_G, GRID_B, 1) end
+      end
       if fs then fs:SetText("") end
       b:SetAlpha(0.9)
     else
-      b:SetNormalTexture(e.texture)
-      AnchorIcon(b, i)
-      if inner then inner:Hide() end
+      if stock then
+        if icon then
+          icon:SetTexture(e.texture)
+          icon:Show()
+        end
+      else
+        b:SetNormalTexture(e.texture)
+        AnchorIcon(b, i)
+        if inner then inner:Hide() end
+      end
+
       if fs then
         if e.count > 1 then fs:SetText(e.count) else fs:SetText("") end
       end
-      if bg then
+
+      -- Rarity. On our own cell it is the fill behind the picture; on a stock
+      -- one there is no room behind anything, so the slot art itself is
+      -- tinted - which is how the game's own bags mark quality too.
+      local plain = (e.quality and e.quality <= 1)
+      if stock then
+        if bg and bg.SetVertexColor then
+          if plain then
+            bg:SetVertexColor(1, 1, 1)
+          else
+            local r, g, bl = QualityColor(e.quality)
+            bg:SetVertexColor(r, g, bl)
+          end
+        end
+      elseif bg then
         -- common and poor quality take the grid colour: otherwise the seam
         -- between two cells is a bright two pixel band and looks thick
-        if e.quality and e.quality <= 1 then
+        if plain then
           bg:SetTexture(GRID_R, GRID_G, GRID_B, 1)
         else
           local r, g, bl = QualityColor(e.quality)
@@ -919,41 +1379,78 @@ local function Refresh()
     i = i + 1
   end
 
-  local footer = "|cff9d9d9d" .. L("money") .. "|r " .. FormatMoney(GetMoney())
-    .. "   |cff5a5a5a|||r   |cff9d9d9d" .. L("free") .. "|r "
-    .. free .. "|cff808080/" .. slotCount .. "|r"
-
-  moneyText:SetText(footer)
+  -- Upper line of the footer: what the character carries, nothing else.
+  moneyText:SetText("|cff9d9d9d" .. L("money") .. "|r")
+  DrawMoney(GetMoney and GetMoney() or 0, "")
 
   -- ItemLens, when installed, knows what a vendor would pay for the contents.
   -- The value takes the right hand corner: putting it next to the money would
   -- run the footer into the hint on a narrow window. Nothing here depends on
-  -- ItemLens being present — no addon, no line, no error.
-  local shown = nil
-  local bagValue, money = PriceApi()
+  -- ItemLens being present - no addon, no line, no error.
+  --
+  -- Written with coins, not with the letters g/s/c, and that costs a layout
+  -- pass: the client draws no picture inside a line of text (probed), so the
+  -- row is measured first and then laid out piece by piece from the left,
+  -- ending exactly at the right edge.
+  local total, bankTotal, bankStale = nil, nil, false
+  local bagValue = PriceApi()
   if AllBagsDB.value and bagValue then
-    local total, known, unknown = bagValue()
-    if type(total) == "number" then
-      shown = "|cff9d9d9d" .. L("value") .. "|r "
-        .. (money and money(total) or total)
-      -- items with no known price are not mentioned any more: the tail of
-      -- "+7?" said nothing useful and only made the line noisy
-
-      -- the bank, if the price addon knows it and the player wants it shown
+    local t = bagValue()
+    if type(t) == "number" then
+      total = t
       local bankValue = BankApi()
       if AllBagsDB.bank and bankValue then
-        local bankTotal, _, _, fresh = bankValue()
-        if type(bankTotal) == "number" then
-          shown = shown .. "  |cff5a5a5a|||r  |cff9d9d9d" .. L("bank") .. "|r "
-            .. (money and money(bankTotal) or bankTotal)
-          if not fresh then shown = shown .. " |cff808080*|r" end
+        local bt, _, _, fresh = bankValue()
+        if type(bt) == "number" then
+          bankTotal = bt
+          bankStale = not fresh
         end
       end
     end
   end
-  hintText:SetText(shown or L("hint"))
+
+  -- Lower line: how much room is left, and what the bag is worth. Laid out
+  -- left to right from the same margin the money uses, so the two lines read
+  -- as a block; the settings button owns the right hand corner and the line
+  -- simply stops before it.
+  local y = FootY()
+  freeText:SetText("|cff9d9d9d" .. L("free") .. "|r " .. free
+    .. "|cff808080/" .. slotCount .. "|r")
+  freeText:ClearAllPoints()
+  freeText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", PAD + 2, y)
+
+  local x = PAD + 2 + TextW(freeText) + 16
+  -- On a six column window there is not room for everything, and a line that
+  -- runs under the settings button reads as rubbish. Measure first, then drop
+  -- the bank, then the value, rather than let them overlap it.
+  local room = frame:GetWidth() - PAD - 2
+    - ((cfgButton and cfgButton:GetWidth()) or 0) - 10 - x
+  if total then
+    local w = StripWidth(valStrip, L("value"), total)
+    local wb = 0
+    if bankTotal then
+      wb = StripWidth(bankStrip, L("bank") .. (bankStale and " *" or ""), bankTotal) + 4
+    end
+    if w + wb > room then wb = 0; bankTotal = nil end
+    if w > room then
+      StripHide(valStrip)
+    else
+      x = StripPlace(valStrip, frame, L("value"), total, x, y)
+    end
+    if bankTotal then
+      StripPlace(bankStrip, frame, L("bank") .. (bankStale and " *" or ""),
+        bankTotal, x + 4, y)
+    else
+      StripHide(bankStrip)
+    end
+  else
+    StripHide(valStrip)
+    StripHide(bankStrip)
+  end
+  hintText:SetText("")
 
   sortButton:SetText(AllBagsDB.sort == "quality" and L("sortQ") or L("sortN"))
+  if cfgButton then cfgButton:SetText(L("cfgOpen")) end
 end
 
 ----------------------------------------------------------------------
@@ -965,7 +1462,7 @@ local menuButtons = {}
 local menuExtra = {}    -- i -> second, right hand button on that line
 local hoverCount, menuIdle, everHovered = 0, 0, false
 
-local ITEM_H, TITLE_H, MPAD = 18, 18, 8
+local ITEM_H, TITLE_H, MPAD = 18, 18, 14
 local COL_CHOICES = { 6, 8, 10, 12, 14, 16 }
 
 local function EnterMenu() hoverCount = hoverCount + 1; everHovered = true; menuIdle = 0 end
@@ -1005,13 +1502,10 @@ local function MenuItems()
     i = i + 1
   end
 
-  add({ mark = "none", text = L("mLine") .. ":", header = true })
-  add({ mark = "radio", indent = true, on = (AllBagsDB.border <= 6), text = L("mThin"), keep = true,
-        action = function() AllBagsDB.border = 5; ApplyBorder() end })
-  add({ mark = "radio", indent = true, on = (AllBagsDB.border > 6 and AllBagsDB.border < 14), text = L("mMed"), keep = true,
-        action = function() AllBagsDB.border = 10; ApplyBorder() end })
-  add({ mark = "radio", indent = true, on = (AllBagsDB.border >= 14), text = L("mThick"), keep = true,
-        action = function() AllBagsDB.border = 16; ApplyBorder() end })
+  -- The frame style, the slot style and the border thickness used to have
+  -- three sections of their own here. Once the stock look won there was
+  -- nothing left to choose between, and the menu was the longer for it.
+  -- Both old looks are still reachable: /bags frame and /bags slots.
 
   add({ mark = "none", text = L("mLang") .. ":", header = true })
   add({ mark = "radio", indent = true, on = (AllBagsDB.lang == "auto"), text = L("mAuto"), keep = true,
@@ -1046,14 +1540,21 @@ local function MenuItems()
   return items, count
 end
 
+-- The choice used to be written as the characters "(*)" and "( )". It is a
+-- real tick box now, and the label has to clear it: the box is 18 wide and
+-- starts two pixels in, so the text may not begin before thirty - nine
+-- spaces at this size. Every box sits at the same two pixels, indented lines
+-- included, so they read as one column down the menu; the indent lives in
+-- the text alone.
+local MARK_PAD = "          "  -- ten spaces: past an 18 pixel box plus air
+
 local function ItemLabel(item)
   local prefix = ""
   if item.mark == "radio" then
-    prefix = item.on and "|cff40ff40(*)|r " or "|cff808080( )|r "
+    prefix = MARK_PAD
   elseif item.indent then
-    prefix = "     "
+    prefix = MARK_PAD
   end
-  if item.indent and item.mark == "radio" then prefix = "   " .. prefix end
   return prefix .. item.text
 end
 
@@ -1081,6 +1582,20 @@ local function GetMenuButton(i)
   b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
   b:SetScript("OnEnter", EnterMenu)
   b:SetScript("OnLeave", LeaveMenu)
+
+  -- The mark is Blizzard's own tick box, not a drawn one: the template was
+  -- probed on this client and its tick draws, whereas a texture file that is
+  -- not in this build would simply show nothing and never say so. The mouse
+  -- is switched off on it, or it would swallow the click meant for the line.
+  local m = Templated("CheckButton", "AllBagsMenuMark" .. i, b, TMPL_CHECK)
+  if m then
+    m:SetWidth(18)
+    m:SetHeight(18)
+    m:SetPoint("LEFT", b, "LEFT", 1, 0)
+    pcall(function() m:EnableMouse(false) end)
+    m:Hide()
+    b.mark = m
+  end
   menuButtons[i] = b
   return b
 end
@@ -1093,14 +1608,17 @@ local function BuildMenu()
   menu:SetToplevel(true)
   menu:SetClampedToScreen(true)
   menu:EnableMouse(true)
+  -- Blizzard's carved frame, the same one the bag and the vault wear. Its
+  -- edge is 32 pixels thick, so the padding inside grows with it - MPAD is
+  -- what keeps the first line off the metal.
   menu:SetBackdrop({
     bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tileSize = 16, edgeSize = 14,
-    insets   = { left = 4, right = 4, top = 4, bottom = 4 },
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 16, edgeSize = 32,
+    insets   = { left = 11, right = 12, top = 12, bottom = 11 },
   })
-  menu:SetBackdropColor(0, 0, 0, 0.94)
-  menu:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+  menu:SetBackdropColor(0, 0, 0, 0.9)
+  menu:SetBackdropBorderColor(1, 1, 1, 1)
   menu:SetScript("OnEnter", EnterMenu)
   menu:SetScript("OnLeave", LeaveMenu)
   menu:SetMovable(true)
@@ -1204,6 +1722,16 @@ ShowMenu = function()
       item.action()
       if item.keep then ShowMenu() else HideMenu() end
     end)
+    if b.mark then
+      if item.mark == "radio" then
+        b.mark:ClearAllPoints()
+        b.mark:SetPoint("LEFT", b, "LEFT", 2, 0)
+        pcall(function() b.mark:SetChecked(item.on and 1 or 0) end)
+        b.mark:Show()
+      else
+        b.mark:Hide()
+      end
+    end
     b:Show()
 
     if item.right then
@@ -1261,8 +1789,104 @@ end
 -- window
 ----------------------------------------------------------------------
 
+Dialog = function()
+  return (AllBagsDB and AllBagsDB.frameStyle or "dialog") == "dialog"
+end
+
+StockSlots = function()
+  return (AllBagsDB and AllBagsDB.slotStyle or "stock") == "stock"
+end
+
+-- The stock dialog edge is 32 pixels of carved metal against our 6 of thin
+-- line, so the content has to move inwards with it. PAD, HEADER and FOOTER
+-- are what the layout measures from, so the style sets them and everything
+-- else follows.
+-- The stock buttons in the header are 22 tall against the 17 of the old
+-- framed ones, so the grid has to start lower in both styles.
+ApplyMetrics = function()
+  -- 37 is the size the game's own cells are, and at that size the slot art
+  -- and the stack figures sit the way they do in the game's bags. The three
+  -- pixels of air keep the beds of two cells from touching.
+  if StockSlots() then
+    -- The game's own bags step by 44 (37 and 7 of air), which is what leaves
+    -- room for the metal of the 64 pixel picture to hang out. Seven read as
+    -- too much air between the columns on a ten column window, so the air is
+    -- 4 and the metal of two neighbours overlaps a little more - which is
+    -- what it does in the game's own bag anyway. /bags gap N retunes it.
+    SIZE = 37
+    if RING_CROP > 0 then GAP = 3 else GAP = STOCK_GAP end
+  else
+    SIZE, GAP = 32, 0
+  end
+
+  if Dialog() then
+    PAD, HEADER, FOOTER = 12, 38, 26
+  else
+    PAD, HEADER, FOOTER = 4, 30, 22
+  end
+  -- Two lines under the grid, always: the purse on the upper one, what the
+  -- bag holds and what it is worth on the lower. The settings button stands
+  -- in the right hand corner across both of them, so the footer also has to
+  -- be tall enough for it.
+  FOOTER = FOOTER + 18
+end
+
+-- Where the footer's own baseline sits: clear of the border, whichever
+-- border it is. The money used to be pinned at 6 and vanished under the
+-- thick edge.
+FootY = function()
+  if Dialog() then return 14 end
+  return 6
+end
+
+-- The pieces around the grid are anchored once, so they have to be put back
+-- when the style - and with it the padding - changes.
+AnchorChrome = function()
+  if not frame then return end
+  -- the word "Bags" over a window full of bags said nothing, so it is gone
+  -- and the vault button stands where it used to
+  if header then header:Hide() end
+  if hintText then
+    hintText:ClearAllPoints()
+    hintText:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -PAD - 2, FootY())
+  end
+  if cfgButton then
+    cfgButton:ClearAllPoints()
+    cfgButton:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -PAD - 2, FootY() - 4)
+  end
+  if sortButton then
+    sortButton:ClearAllPoints()
+    sortButton:SetPoint("TOP", frame, "TOP", 0, Dialog() and -12 or -5)
+  end
+  -- the cross is deliberately NOT re-anchored here: it is placed once when it
+  -- is built, and moving it on every layout made it twitch
+  if vaultButton then
+    vaultButton:ClearAllPoints()
+    vaultButton:SetPoint("TOPLEFT", frame, "TOPLEFT",
+      PAD + 2, Dialog() and -12 or -5)
+  end
+end
+
 ApplyBorder = function()
   if not frame then return end
+  ApplyMetrics()
+
+  if Dialog() then
+    -- Probed on this client: the stock dialog BORDER draws, the stock dialog
+    -- BACKGROUND comes out transparent whatever the tiling. So the carved
+    -- frame is Blizzard's and the fill stays ours.
+    frame:SetBackdrop({
+      bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+      tile = true, tileSize = 16, edgeSize = 32,
+      insets   = { left = 11, right = 12, top = 12, bottom = 11 },
+    })
+    frame:SetBackdropColor(0, 0, 0, 0.9)
+    frame:SetBackdropBorderColor(1, 1, 1, 1)
+    AnchorChrome()
+    return
+  end
+
   local e = AllBagsDB and AllBagsDB.border or 6
   if type(e) ~= "number" or e < 2 then e = 6 end
   if e > 24 then e = 24 end
@@ -1279,6 +1903,7 @@ ApplyBorder = function()
   -- SetBackdrop resets the colours, so set them again
   frame:SetBackdropColor(0, 0, 0, 0.9)
   frame:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+  AnchorChrome()
 end
 
 -- Other characters. The button sits by the title, not by the close cross: a
@@ -1286,36 +1911,39 @@ end
 -- which is why the old settings button had to go. It appears only when
 -- AllBagsVault.lua is loaded, so it never points at nothing - and it cannot
 -- be built inside BuildFrame, which runs before that file is loaded.
-local vaultButton
 local function AddVaultButton()
   if vaultButton or not frame then return end
   if type(AllBagsVault_Toggle) ~= "function" then return end
 
-  local vb = CreateFrame("Button", "AllBagsVaultOpen", frame)
-  vaultButton = vb
-  -- Not by the title: the sort switch is centred and 150 wide, so on a narrow
-  -- window it walks right over that spot. Anchored to the right edge instead,
-  -- with a gap the close cross cannot be missed into.
-  vb:SetWidth(44)
-  vb:SetHeight(17)
-  vb:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6)
-
   -- An icon here came out invisible: this client has no such file, and a
-  -- missing texture draws nothing at all rather than complaining. A framed
-  -- word always renders, so that is what the button is.
-  vb:SetFont("Fonts\\FRIZQT__.TTF", 11)
+  -- missing texture draws nothing at all rather than complaining. A word on
+  -- a stock button always renders, so that is what the button is.
+  local vb = Templated("Button", "AllBagsVaultOpen", frame, TMPL_BTN)
+  if vb then
+    vb:SetWidth(56)
+    vb:SetHeight(22)
+  else
+    vb = CreateFrame("Button", "AllBagsVaultOpen", frame)
+    vb:SetWidth(44)
+    vb:SetHeight(17)
+    vb:SetFont("Fonts\\FRIZQT__.TTF", 11)
+    vb:SetTextColor(1, 0.82, 0)
+    vb:SetBackdrop({
+      bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tileSize = 16, edgeSize = 10,
+      insets   = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    vb:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+    vb:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
+    vb:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  end
+  vaultButton = vb
   vb:SetText(L("mAlts"))
-  vb:SetTextColor(1, 0.82, 0)
-  vb:SetBackdrop({
-    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tileSize = 16, edgeSize = 10,
-    insets   = { left = 2, right = 2, top = 2, bottom = 2 },
-  })
-  vb:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
-  vb:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
-
-  vb:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  -- The left hand corner, where the word "Bags" used to be: a header button
+  -- by the close cross is one miss away from shutting the window, and the
+  -- title itself said nothing a window full of bags did not already say.
+  vb:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + 2, -6)
   vb:SetScript("OnClick", function() AllBagsVault_Toggle() end)
   vb:SetScript("OnEnter", function()
     if not GameTooltip then return end
@@ -1325,6 +1953,7 @@ local function AddVaultButton()
     GameTooltip:Show()
   end)
   vb:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+  if AnchorChrome then AnchorChrome() end
 end
 
 ApplyPosition = function()
@@ -1410,21 +2039,63 @@ local function BuildFrame()
   hintText:SetJustifyH("RIGHT")
   hintText:SetTextColor(0.6, 0.6, 0.6)
 
-  moneyText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  if not moneyText:GetFont() or moneyText:GetFont() == "" then
-    moneyText:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+  local function Foot(size)
+    local fs = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    if not fs:GetFont() or fs:GetFont() == "" then
+      fs:SetFont("Fonts\\FRIZQT__.TTF", size, "")
+    end
+    fs:SetJustifyH("LEFT")
+    return fs
   end
-  moneyText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", PAD + 2, 6)
-  moneyText:SetJustifyH("LEFT")
 
-  closeButton = CreateFrame("Button", "AllBagsClose", frame)
-  closeButton:SetWidth(18)
-  closeButton:SetHeight(18)
-  closeButton:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -5, -5)
-  closeButton:SetFont("Fonts\\FRIZQT__.TTF", 14)
-  closeButton:SetText("X")
-  closeButton:SetTextColor(1, 0.35, 0.35)
-  closeButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  moneyText = Foot(12)
+  moneyText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", PAD + 2, 6)
+
+  -- three coins out of one atlas: gold, silver, copper
+  coin = {}
+  local k = 1
+  while k <= 3 do
+    local ic = frame:CreateTexture(nil, "OVERLAY")
+    ic:SetWidth(COIN)
+    ic:SetHeight(COIN)
+    ic:SetTexture(MONEY_ATLAS)
+    ic:SetTexCoord((k - 1) * 0.25, k * 0.25, 0, 1)
+    ic:Hide()
+    coin[k] = { icon = ic, num = Foot(12) }
+    coin[k].num:Hide()
+    k = k + 1
+  end
+
+  freeText = Foot(12)
+
+  -- the value line gets coins of its own, on its own row
+  valStrip  = NewStrip(frame, 11)
+  bankStrip = NewStrip(frame, 11)
+
+  -- Blizzard's own cross where it exists, and the hand-drawn letter where it
+  -- does not. The stock one brings its own art and its own size.
+  closeButton = Templated("Button", "AllBagsClose", frame, TMPL_CLOSE)
+  if closeButton then
+    closeButton.allbagsStock = true
+  else
+    closeButton = CreateFrame("Button", "AllBagsClose", frame)
+    closeButton:SetWidth(18)
+    closeButton:SetHeight(18)
+    closeButton:SetFont("Fonts\\FRIZQT__.TTF", 14)
+    closeButton:SetText("X")
+    closeButton:SetTextColor(1, 0.35, 0.35)
+    closeButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  end
+  -- The stock cross is a 32 pixel button whose art is NOT centred in it: on
+  -- the screen the cross itself sits about six pixels above the button's
+  -- middle, so pinned at -3 it rode visibly higher than the header buttons
+  -- next to it (measured off a screenshot: cross centre 425, button text
+  -- centre 433). Six pixels down puts them on one line.
+  if closeButton.allbagsStock then
+    closeButton:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -3, -9)
+  else
+    closeButton:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -5, -5)
+  end
   closeButton:SetScript("OnClick", function() frame:Hide() end)
 
 
@@ -1432,23 +2103,57 @@ local function BuildFrame()
   -- cross. It crowded a header that is only 300 wide: settings live on the
   -- sort line of the right click menu instead.
 
-  sortButton = CreateFrame("Button", "AllBagsSort", frame)
-  sortButton:SetWidth(150)
-  sortButton:SetHeight(17)
+  -- A caption on a bare button has nothing to write into, which is why two
+  -- of these came out blank once. On a templated button the FontString is
+  -- part of the template, and it draws - probed on this client.
+  sortButton = Templated("Button", "AllBagsSort", frame, TMPL_BTN)
+  if sortButton then
+    sortButton:SetWidth(150)
+    sortButton:SetHeight(22)
+  else
+    sortButton = CreateFrame("Button", "AllBagsSort", frame)
+    sortButton:SetWidth(150)
+    sortButton:SetHeight(17)
+    sortButton:SetFont("Fonts\\FRIZQT__.TTF", 11)
+    sortButton:SetTextColor(1, 1, 1)
+    sortButton:SetBackdrop({
+      bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tileSize = 16, edgeSize = 10,
+      insets   = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    sortButton:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+    sortButton:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
+    sortButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  end
   -- Centred, not pinned to the right: the close cross owns that corner and
   -- the switch pressed against it looked like part of the cross.
   sortButton:SetPoint("TOP", frame, "TOP", 0, -6)
-  sortButton:SetFont("Fonts\\FRIZQT__.TTF", 11)
-  sortButton:SetTextColor(1, 1, 1)
-  sortButton:SetBackdrop({
-    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tileSize = 16, edgeSize = 10,
-    insets   = { left = 2, right = 2, top = 2, bottom = 2 },
-  })
-  sortButton:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
-  sortButton:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
-  sortButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+
+  -- Settings, in the right hand corner of the footer. It used to live only in
+  -- the right click menu, which is fine once you know the menu is there.
+  cfgButton = Templated("Button", "AllBagsConfigOpen", frame, TMPL_BTN)
+  if cfgButton then
+    cfgButton:SetWidth(92)
+    cfgButton:SetHeight(22)
+  else
+    cfgButton = CreateFrame("Button", "AllBagsConfigOpen", frame)
+    cfgButton:SetWidth(80)
+    cfgButton:SetHeight(18)
+    cfgButton:SetFont("Fonts\\FRIZQT__.TTF", 11)
+    cfgButton:SetTextColor(1, 0.82, 0)
+    cfgButton:SetBackdrop({
+      bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tileSize = 16, edgeSize = 10,
+      insets   = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    cfgButton:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+    cfgButton:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.9)
+    cfgButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  end
+  cfgButton:SetText(L("cfgOpen"))
+  cfgButton:SetScript("OnClick", function() ShowConfig() end)
 
   -- The "Off" button used to sit here, one step from the close cross, and a
   -- miss disabled the whole addon. Turning it off lives in the right click
@@ -1492,6 +2197,8 @@ local KEY_LABEL = {
 local cfg                  -- the window, built the first time it is asked for
 local cfgRows = {}         -- n -> { up, down, box, label }
 local cfgNum  = {}         -- field -> FontString with the current number
+local cfgSlider = {}       -- field -> Blizzard slider, when the template took
+local cfgSetting = false   -- guard: writing a value back must not re-apply it
 local cfgFS   = {}         -- name -> caption that has to follow the language
 local cfgBox               -- the "split by bag" checkbox
 local cfgSortBox           -- sorting on or off, the same switch as the header
@@ -1500,8 +2207,20 @@ local CfgRefresh
 -- Both side windows remember where they were left, the same way the main one
 -- does: absolute left and bottom, because StartMoving re-anchors the frame and
 -- a saved anchor pair could put it somewhere else on the next login.
+-- The stock button art is drawn for something at least twenty pixels tall;
+-- a 16 pixel one comes out squashed, so the little arrows and boxes keep the
+-- thin frame and only the real buttons get the template.
 local function CfgButton(parent, w, h, text)
-  local b = CreateFrame("Button", nil, parent)
+  local b = nil
+  if h >= 20 then b = Templated("Button", nil, parent, TMPL_BTN) end
+  if b then
+    b:SetWidth(w)
+    b:SetHeight(h)
+    b:SetText(text)
+    return b
+  end
+
+  b = CreateFrame("Button", nil, parent)
   b:SetWidth(w)
   b:SetHeight(h)
   b:SetFont("Fonts\\FRIZQT__.TTF", 11)
@@ -1519,6 +2238,48 @@ local function CfgButton(parent, w, h, text)
   return b
 end
 
+-- The cross that closes a window: Blizzard's own where it exists, our small
+-- framed letter where it does not.
+local function CfgClose(parent)
+  local c = Templated("Button", nil, parent, TMPL_CLOSE)
+  if c then
+    c.allbagsStock = true
+    return c
+  end
+  return CfgButton(parent, 18, 18, "X")
+end
+
+-- A tick box. Blizzard's own where it exists: it brings the tick, the
+-- highlight and the pressed state, and it answers SetChecked instead of
+-- having a letter written into it.
+local function CfgCheck(parent)
+  local c = Templated("CheckButton", nil, parent, TMPL_CHECK)
+  if c then
+    c:SetWidth(22)
+    c:SetHeight(22)
+    c.allbagsStock = true
+    return c
+  end
+  return CfgButton(parent, 16, 16, "")
+end
+
+-- One way to tick a box whichever kind it turned out to be.
+local function SetTick(box, on, bright)
+  if not box then return end
+  if box.allbagsStock then
+    pcall(function() box:SetChecked(on and 1 or 0) end)
+    return
+  end
+  box:SetText(on and "x" or "")
+  if box.SetBackdropBorderColor then
+    if bright then
+      box:SetBackdropBorderColor(1, 0.82, 0, 1)
+    else
+      box:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.9)
+    end
+  end
+end
+
 -- Every caption is given a width and a justification: left to itself a
 -- FontString centres on its anchor and the column comes out ragged.
 local function CfgText(parent, x, y, w, size, r, g, b, just)
@@ -1533,7 +2294,25 @@ local function CfgText(parent, x, y, w, size, r, g, b, just)
   return fs
 end
 
--- Moves one criterion up or down the list. The order is what the comparison
+-- A caption that belongs to a tick box. Anchored to the box itself, not to
+-- the window, so the two are on one line whatever height the box turns out
+-- to be - the stock box is 22 tall, our fallback 16, and pinning both to the
+-- window by hand is what left them sitting at different heights. The gap is
+-- eight: the stock art has its own frame around the tick, and text pressed
+-- against it read as if it were inside the box.
+local function CfgBoxLabel(box, w, size, r, g, b)
+  local fs = cfg:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  fs:SetFont("Fonts\\FRIZQT__.TTF", size, "")
+  fs:SetTextColor(r, g, b)
+  fs:SetWidth(w)
+  fs:SetHeight(size + 4)
+  fs:SetJustifyH("LEFT")
+  fs:SetJustifyV("MIDDLE")
+  fs:SetPoint("LEFT", box, "RIGHT", 8, 0)
+  return fs
+end
+
+-- Moves one criterion up or down the list.-- Moves one criterion up or down the list. The order is what the comparison
 -- walks, so the top line is the coarse grouping.
 local function MoveKey(n, dir)
   local ord = AllBagsDB.order
@@ -1545,37 +2324,35 @@ local function MoveKey(n, dir)
 end
 
 local CFG_W = 320
-local CFG_LEFT, CFG_RIGHT = 14, 14
+-- the carved frame eats twelve pixels of its own, so the columns start
+-- further in than they did behind the thin tooltip border
+local CFG_LEFT, CFG_RIGHT = 18, 18
 
+-- A number the player drags instead of clicking up one at a time. The
+-- template is Blizzard's own and it draws on this client (probed with
+-- UiProbe): it brings the groove, the knob and three labels of its own,
+-- named $parentText, $parentLow and $parentHigh. The middle one is blanked
+-- because the value keeps its own column on the right, where it always was.
 local function CfgStepper(y, key, field, lo, hi, step)
-  cfgFS[field] = CfgText(cfg, CFG_LEFT, y, CFG_W - CFG_LEFT - 96, 11, 0.82, 0.82, 0.82)
+  cfgFS[field] = CfgText(cfg, CFG_LEFT, y, CFG_W - CFG_LEFT - 190, 11, 0.82, 0.82, 0.82)
+  cfgNum[field] = CfgText(cfg, CFG_W - CFG_RIGHT - 30, y, 30, 12, 1, 0.82, 0, "RIGHT")
 
-  local minus = CfgButton(cfg, 18, 18, "-")
-  minus:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_W - 90, y - 1)
-
-  cfgNum[field] = CfgText(cfg, CFG_W - 68, y, 34, 12, 1, 0.82, 0, "CENTER")
-
-  local plus = CfgButton(cfg, 18, 18, "+")
-  plus:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_W - 32 - CFG_RIGHT + 10, y - 1)
-
-  local function bump(d)
-    local v
+  -- csize is not a free number: it steps between the font objects the client
+  -- actually has, so whatever the widget says is snapped to the nearest one
+  local function Apply(v)
     if field == "csize" then
-      -- the figure size is not a free number: it steps between the font
-      -- objects the client actually has
-      local cur, k = 1, 1
-      local now = CountFontEntry(AllBagsDB.csize)
+      local best, bestd, k = nil, nil, 1
       while COUNT_FONTS[k] do
-        if COUNT_FONTS[k].o == now.o then cur = k end
+        local d = COUNT_FONTS[k].n - v
+        if d < 0 then d = -d end
+        if not bestd or d < bestd then best, bestd = COUNT_FONTS[k].n, d end
         k = k + 1
       end
-      cur = cur + d
-      if cur < 1 then cur = 1 elseif not COUNT_FONTS[cur] then cur = cur - 1 end
-      v = COUNT_FONTS[cur].n
+      v = best or v
     else
-      v = (AllBagsDB[field] or lo) + d * step
       if v < lo then v = lo elseif v > hi then v = hi end
     end
+    if AllBagsDB[field] == v then return end
     AllBagsDB[field] = v
     lastCols = -1
     dirty = true
@@ -1583,8 +2360,41 @@ local function CfgStepper(y, key, field, lo, hi, step)
     CfgRefresh()
   end
 
-  minus:SetScript("OnClick", function() bump(-1) end)
-  plus:SetScript("OnClick", function() bump(1) end)
+  local name = "AllBagsCfgSlider" .. field
+  local sl = Templated("Slider", name, cfg, TMPL_SLIDER)
+  if sl then
+    sl:SetWidth(120)
+    sl:SetHeight(16)
+    sl:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_W - CFG_RIGHT - 158, y - 4)
+    pcall(function() sl:SetOrientation("HORIZONTAL") end)
+    sl:SetMinMaxValues(lo, hi)
+    sl:SetValueStep(step)
+    sl:SetValue(AllBagsDB[field] or lo)
+    local t = getglobal(name .. "Text");  if t then t:SetText("") end
+    local l = getglobal(name .. "Low");   if l then l:SetText(lo) end
+    local h = getglobal(name .. "High");  if h then h:SetText(hi) end
+    -- CfgRefresh writes the value back into the slider, and that fires this
+    -- again: without the guard the two call each other until the stack ends
+    sl:SetScript("OnValueChanged", function()
+      if cfgSetting then return end
+      local self = this or sl
+      Apply(math.floor(self:GetValue() + 0.5))
+    end)
+    cfgSlider[field] = sl
+  else
+    -- no template on this client after all: the old pair of buttons
+    local minus = CfgButton(cfg, 18, 18, "-")
+    minus:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_W - 90, y - 1)
+    local plus = CfgButton(cfg, 18, 18, "+")
+    plus:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_W - 32 - CFG_RIGHT + 10, y - 1)
+    minus:SetScript("OnClick", function()
+      Apply((AllBagsDB[field] or lo) - step)
+    end)
+    plus:SetScript("OnClick", function()
+      Apply((AllBagsDB[field] or lo) + step)
+    end)
+  end
+
   cfgFS[field].key = key
 end
 
@@ -1599,12 +2409,12 @@ local function BuildConfig()
   cfg:SetHeight(300)
   cfg:SetBackdrop({
     bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets   = { left = 3, right = 3, top = 3, bottom = 3 },
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 16, edgeSize = 32,
+    insets   = { left = 11, right = 12, top = 12, bottom = 11 },
   })
-  cfg:SetBackdropColor(0.05, 0.05, 0.05, 0.92)
-  cfg:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+  cfg:SetBackdropColor(0, 0, 0, 0.9)
+  cfg:SetBackdropBorderColor(1, 1, 1, 1)
   cfg:Hide()
   EscClose("AllBagsConfig")
 
@@ -1622,24 +2432,26 @@ local function BuildConfig()
     end
   end)
 
-  cfgFS.title = CfgText(cfg, CFG_LEFT, -10, CFG_W - CFG_LEFT * 2 - 20, 13, 1, 0.82, 0)
-  cfgFS.hint  = CfgText(cfg, CFG_LEFT, -28, CFG_W - CFG_LEFT * 2, 10, 0.55, 0.55, 0.55)
-  cfgSortBox = CfgButton(cfg, 16, 16, "")
-  cfgSortBox:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_LEFT, -47)
+  cfgFS.title = CfgText(cfg, CFG_LEFT, -16, CFG_W - CFG_LEFT * 2 - 20, 13, 1, 0.82, 0)
+  cfgFS.hint  = CfgText(cfg, CFG_LEFT, -34, CFG_W - CFG_LEFT * 2, 10, 0.55, 0.55, 0.55)
+  cfgSortBox = CfgCheck(cfg)
+  cfgSortBox:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_LEFT, -53)
   cfgSortBox:SetScript("OnClick", function()
     AllBagsDB.sort = (AllBagsDB.sort == "quality") and "bag" or "quality"
     dirty = true
     CfgRefresh()
     Refresh()
   end)
-  cfgFS.sort = CfgText(cfg, CFG_LEFT + 24, -48, CFG_W - CFG_LEFT * 2 - 24, 11, 0.75, 0.75, 0.75)
+  cfgFS.sort = CfgBoxLabel(cfgSortBox, CFG_W - CFG_LEFT * 2 - 34, 11, 0.75, 0.75, 0.75)
 
-  local close = CfgButton(cfg, 18, 18, "X")
-  close:SetPoint("TOPRIGHT", cfg, "TOPRIGHT", -6, -6)
+  local close = CfgClose(cfg)
+  -- the stock cross draws about six pixels above its own middle, so it is
+  -- pinned lower than the corner suggests
+  close:SetPoint("TOPRIGHT", cfg, "TOPRIGHT", -4, -10)
   close:SetTextColor(1, 0.35, 0.35)
   close:SetScript("OnClick", function() cfg:Hide() end)
 
-  local y = -66
+  local y = -74
   local i = 1
   while i <= Count(SORT_KEYS) do
     local n = i
@@ -1653,7 +2465,7 @@ local function BuildConfig()
     row.down:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_LEFT + 18, y)
     row.down:SetScript("OnClick", function() MoveKey(n, 1) end)
 
-    row.box = CfgButton(cfg, 16, 16, "")
+    row.box = CfgCheck(cfg)
     row.box:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_LEFT + 42, y)
     row.box:SetScript("OnClick", function()
       local e = AllBagsDB.order and AllBagsDB.order[n]
@@ -1663,7 +2475,7 @@ local function BuildConfig()
       CfgRefresh()
     end)
 
-    row.label = CfgText(cfg, CFG_LEFT + 66, y - 1, CFG_W - CFG_LEFT - 80, 12, 1, 1, 1)
+    row.label = CfgBoxLabel(row.box, CFG_W - CFG_LEFT - 90, 12, 1, 1, 1)
     cfgRows[i] = row
 
     y = y - 20
@@ -1683,11 +2495,9 @@ local function BuildConfig()
   CfgStepper(y, "cfgSize", "csize", 8, 24, 1)
   y = y - 22
   CfgStepper(y, "cfgCols", "cols", 4, 20, 1)
-  y = y - 22
-  CfgStepper(y, "cfgLine", "line", 0, 6, 1)
   y = y - 26
 
-  cfgBox = CfgButton(cfg, 16, 16, "")
+  cfgBox = CfgCheck(cfg)
   cfgBox:SetPoint("TOPLEFT", cfg, "TOPLEFT", CFG_LEFT, y)
   cfgBox:SetScript("OnClick", function()
     AllBagsDB.groups = not AllBagsDB.groups
@@ -1695,15 +2505,15 @@ local function BuildConfig()
     CfgRefresh()
     Refresh()
   end)
-  cfgFS.group = CfgText(cfg, CFG_LEFT + 24, y - 1, CFG_W - CFG_LEFT - 38, 11, 0.85, 0.85, 0.85)
-  y = y - 30
+  cfgFS.group = CfgBoxLabel(cfgBox, CFG_W - CFG_LEFT - 48, 11, 0.85, 0.85, 0.85)
+  y = y - 34
 
-  local done = CfgButton(cfg, 90, 20, "")
-  done:SetPoint("TOP", cfg, "TOP", 0, y + 2)
+  local done = CfgButton(cfg, 90, 22, "")
+  done:SetPoint("TOP", cfg, "TOP", 0, y + 4)
   done:SetScript("OnClick", function() cfg:Hide() end)
   cfg.done = done
 
-  cfg:SetHeight(-y + 24)
+  cfg:SetHeight(-y + 34)
 end
 
 CfgRefresh = function()
@@ -1713,9 +2523,7 @@ CfgRefresh = function()
   cfgFS.sort:SetText(L("cfgSort") .. ":")
 
   local sorting = (AllBagsDB.sort == "quality")
-  cfgSortBox:SetText(sorting and "x" or "")
-  cfgSortBox:SetBackdropBorderColor(sorting and 1 or 0.4, sorting and 0.82 or 0.4,
-                                    sorting and 0 or 0.4, 1)
+  SetTick(cfgSortBox, sorting, sorting)
   cfgFS.sort:SetTextColor(sorting and 0.85 or 0.45, sorting and 0.85 or 0.45,
                           sorting and 0.85 or 0.45)
   cfgFS.group:SetText(L("cfgGroup"))
@@ -1730,34 +2538,34 @@ CfgRefresh = function()
     local row = cfgRows[i]
     if e then
       row.label:SetText(L(KEY_LABEL[e.k] or e.k))
-      row.box:SetText(e.on and "x" or "")
+      SetTick(row.box, e.on, e.on)
       if e.on then
         row.label:SetTextColor(1, 1, 1)
-        row.box:SetBackdropBorderColor(1, 0.82, 0, 1)
       else
         row.label:SetTextColor(0.45, 0.45, 0.45)
-        row.box:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.9)
       end
       if i == 1 then row.up:Disable() else row.up:Enable() end
       if ord[i + 1] then row.down:Enable() else row.down:Disable() end
     else
       row.label:SetText("")
-      row.box:SetText("")
+      SetTick(row.box, false, false)
     end
     i = i + 1
   end
 
-  cfgBox:SetText(AllBagsDB.groups and "x" or "")
-  cfgBox:SetBackdropBorderColor(AllBagsDB.groups and 1 or 0.4,
-                                AllBagsDB.groups and 0.82 or 0.4,
-                                AllBagsDB.groups and 0 or 0.4, 1)
+  SetTick(cfgBox, AllBagsDB.groups, AllBagsDB.groups)
 
   local f = 1
-  local fields = { "csize", "cols", "line" }
+  local fields = { "csize", "cols" }
   while fields[f] do
     local k = fields[f]
     if cfgFS[k] then cfgFS[k]:SetText(L(cfgFS[k].key)) end
     if cfgNum[k] then cfgNum[k]:SetText("" .. (AllBagsDB[k] or 0)) end
+    if cfgSlider[k] then
+      cfgSetting = true
+      pcall(function() cfgSlider[k]:SetValue(AllBagsDB[k] or 0) end)
+      cfgSetting = false
+    end
     f = f + 1
   end
 end
@@ -1792,12 +2600,12 @@ local function BuildTypes()
   tw:SetHeight(200)
   tw:SetBackdrop({
     bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets   = { left = 3, right = 3, top = 3, bottom = 3 },
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 16, edgeSize = 32,
+    insets   = { left = 11, right = 12, top = 12, bottom = 11 },
   })
-  tw:SetBackdropColor(0.05, 0.05, 0.05, 0.92)
-  tw:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+  tw:SetBackdropColor(0, 0, 0, 0.9)
+  tw:SetBackdropBorderColor(1, 1, 1, 1)
   tw:Hide()
   EscClose("AllBagsTypes")
 
@@ -1813,15 +2621,15 @@ local function BuildTypes()
     end
   end)
 
-  twFS.title = CfgText(tw, CFG_LEFT, -10, CFG_W - CFG_LEFT * 2 - 20, 13, 1, 0.82, 0)
-  twFS.hint  = CfgText(tw, CFG_LEFT, -28, CFG_W - CFG_LEFT * 2, 10, 0.55, 0.55, 0.55)
+  twFS.title = CfgText(tw, CFG_LEFT, -16, CFG_W - CFG_LEFT * 2 - 20, 13, 1, 0.82, 0)
+  twFS.hint  = CfgText(tw, CFG_LEFT, -34, CFG_W - CFG_LEFT * 2, 10, 0.55, 0.55, 0.55)
 
-  local close = CfgButton(tw, 18, 18, "X")
-  close:SetPoint("TOPRIGHT", tw, "TOPRIGHT", -6, -6)
+  local close = CfgClose(tw)
+  close:SetPoint("TOPRIGHT", tw, "TOPRIGHT", -4, -10)
   close:SetTextColor(1, 0.35, 0.35)
   close:SetScript("OnClick", function() tw:Hide() end)
 
-  local y = -48
+  local y = -56
   local i = 1
   while i <= TW_ROWS do
     local n = i
@@ -1841,7 +2649,7 @@ local function BuildTypes()
     i = i + 1
   end
 
-  local done = CfgButton(tw, 90, 20, "")
+  local done = CfgButton(tw, 90, 22, "")
   done:SetPoint("TOP", tw, "TOP", 0, 0)
   done:SetScript("OnClick", function() tw:Hide() end)
   tw.done = done
@@ -1875,10 +2683,10 @@ TwRefresh = function()
   local shown = n
   if shown > TW_ROWS then shown = TW_ROWS end
   if shown < 1 then shown = 1 end
-  local bottom = -48 - shown * 20 - 8
+  local bottom = -56 - shown * 20 - 10
   tw.done:ClearAllPoints()
   tw.done:SetPoint("TOP", tw, "TOP", 0, bottom)
-  tw:SetHeight(-bottom + 26)
+  tw:SetHeight(-bottom + 36)
 end
 
 ShowTypes = function()
@@ -2036,6 +2844,32 @@ local function HandleSlash(msg)
   elseif msg == "menu" then
     ToggleMenu()
 
+  elseif msg == "frame" then
+    AllBagsDB.frameStyle = (AllBagsDB.frameStyle == "dialog") and "tooltip" or "dialog"
+    ApplyBorder()
+    lastCols = -1
+    dirty = true
+    Print(L("cfgFrame") .. ": " ..
+      (AllBagsDB.frameStyle == "dialog" and L("frDialog") or L("frTip")))
+
+  elseif msg == "slots" then
+    AllBagsDB.slotStyle = StockSlots() and "plain" or "stock"
+    Print(L("cfgSlot") .. ": " ..
+      (StockSlots() and L("slStock") or L("slPlain")) .. " — /reload")
+
+  elseif msg == "hover" then
+    Print("hover: " .. (lastHover == "" and "-" or lastHover))
+    local b = hoverIndex and buttons[hoverIndex]
+    if b then
+      Print("cell: stock=" .. tostring(stockSlot[hoverIndex] and true or false)
+        .. ", name=" .. tostring(b.GetName and b:GetName()))
+    end
+    if GameTooltip then
+      local own = GameTooltip.GetOwner and GameTooltip:GetOwner()
+      Print("tooltip: shown=" .. tostring(GameTooltip:IsShown())
+        .. ", owner=" .. tostring(own and own.GetName and own:GetName()))
+    end
+
   elseif msg == "config" or msg == "cfg" or msg == "options" then
     ShowConfig()
 
@@ -2096,6 +2930,98 @@ local function HandleSlash(msg)
     AllBagsDB.sort = (AllBagsDB.sort == "quality") and "bag" or "quality"
     dirty = true
     Print(AllBagsDB.sort == "quality" and L("sortQ") or L("sortN"))
+
+  -- Hidden: the two windows, side by side in numbers. The bag cells and the
+  -- vault cells are built from the same recipe, yet on screen the vault ones
+  -- came out with black around the picture - so instead of squinting at a
+  -- screenshot again, ask both windows what their pieces actually are.
+  -- Note: no select() and no GetRegions() here. This client is Lua 5.0 era
+  -- (select does not exist) and GetNumRegions already lied once, answering 0
+  -- for a window full of art. Each window reports the pieces it holds itself.
+  elseif msg == "cmp" then
+    local function Part(label, t)
+      if not t then Print("  " .. label .. ": " .. L("no")); return end
+      local file, w, h, pt, x, y = nil, 0, 0, nil, nil, nil
+      pcall(function() file = t.GetTexture and t:GetTexture() end)
+      pcall(function() w, h = t:GetWidth(), t:GetHeight() end)
+      pcall(function() pt, _, _, x, y = t:GetPoint(1) end)
+      Print("  " .. label .. ": " .. tostring(file) .. " " .. tostring(w) .. "x"
+        .. tostring(h) .. " " .. tostring(pt) .. " (" .. tostring(x) .. ","
+        .. tostring(y) .. ")" .. (t:IsShown() and "" or " |cff808080hidden|r"))
+    end
+
+    local b = buttons[1]
+    Print("|cffffd700bag cell|r: " .. (b and (b:GetWidth() .. "x" .. b:GetHeight()) or L("no"))
+      .. ", " .. L("cfgCols") .. " " .. AllBagsDB.cols)
+    Part("bed", innerTex[1])
+    Part("icon", iconTex[1])
+    Part("ring", bgTex[1])
+
+    if type(AllBagsVault_CellInfo) == "function" then
+      AllBagsVault_CellInfo()
+    else
+      Print("|cffffd700vault cell|r: " .. L("no"))
+    end
+
+  -- Hidden: the air between stock cells, live.
+  elseif string.sub(msg, 1, 3) == "gap" then
+    local _, _, raw = string.find(msg, "^gap%s+(%d+)$")
+    local n = tonumber(raw)
+    if n and n >= 0 and n <= 12 then
+      STOCK_GAP = n
+      ApplyMetrics()
+      lastCols = -1
+      dirty = true
+      Refresh()
+      Print("gap: " .. GAP .. ", " .. L("cfgCols") .. " " .. AllBagsDB.cols)
+    else
+      Print("gap: 0 .. 12, /bags gap 4")
+    end
+
+  -- Hidden: try the measured patches of hide under the empty cells, live.
+  -- /bags bed 0 goes back to the flat brown.
+  elseif string.sub(msg, 1, 3) == "bed" then
+    local _, _, raw, sh = string.find(msg, "^bed%s+(%d+)%s*([%d%.]*)$")
+    local n = tonumber(raw)
+    if n and n >= 0 and n <= 6 then
+      bedSpot = n
+      bedShade = tonumber(sh) or 1
+      if bedShade < 0.3 then bedShade = 0.3 end
+      if bedShade > 2 then bedShade = 2 end
+      local i = 1
+      while buttons[i] do
+        if stockSlot[i] then ApplyBed(innerTex[i]) end
+        i = i + 1
+      end
+      if n == 0 then
+        Print("bed: " .. L("bedFlat"))
+      else
+        Print("bed: " .. n .. ", shade " .. bedShade)
+      end
+    else
+      Print("bed: 0 .. 6 [+ 0.3 .. 2], /bags bed 3 0.9")
+    end
+
+  -- Hidden: retune the slot ring crop live, without a reload. Kept because
+  -- only a human eye can tell whether a texture landed where it should.
+  elseif string.sub(msg, 1, 4) == "crop" then
+    local _, _, raw = string.find(msg, "^crop%s+([%d%.]+)$")
+    local n = tonumber(raw)
+    if n and n >= 0 and n < 0.5 then
+      RING_CROP = n
+      ApplyMetrics()
+      local i = 1
+      while buttons[i] do
+        if stockSlot[i] then ApplyRing(bgTex[i]) end
+        i = i + 1
+      end
+      lastCols = -1
+      dirty = true
+      Refresh()
+      Print("crop: " .. n .. ", size " .. SIZE .. ", gap " .. GAP)
+    else
+      Print("crop: 0 .. 0.49, /bags crop 0.22")
+    end
 
   elseif string.sub(msg, 1, 4) == "cols" then
     local _, _, n = string.find(msg, "^cols%s+(%d+)$")

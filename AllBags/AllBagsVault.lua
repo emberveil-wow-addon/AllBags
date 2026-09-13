@@ -23,7 +23,7 @@
 ----------------------------------------------------------------------]]
 
 local ADDON   = "AllBags"
-local VERSION = "1.2.0"
+local VERSION = "1.3.0"
 
 local FIRST_BAG, LAST_BAG = 0, 4
 local BANK_PANEL          = -1
@@ -31,12 +31,15 @@ local BANK_PANEL_SLOTS    = 24     -- GetContainerNumSlots(-1) answers 0 here
 local FIRST_BANK, LAST_BANK = 5, 10
 local GEAR_SLOTS          = 19
 
-local SIZE, GAP  = 32, 0
+-- The same numbers the bag window uses now: a 37 pixel cell with 4 of air,
+-- because the slot picture the client draws is 64 wide and has to hang out
+-- over the gap. See AllBags.lua for how those were arrived at.
+local SIZE, GAP  = 37, 4
 local COLS       = 10
 local ROW_H      = 18
 local LIST_W     = 156           -- the character column on the left
 local PAD        = 12
-local CONTENT_W  = COLS * SIZE + 12   -- right column: cells plus a margin
+local CONTENT_W  = COLS * (SIZE + GAP) + 12   -- cells plus a margin
 local TABS_Y     = -112          -- tab row; the skill line above it may wrap
 local PICKS_Y    = 134           -- first character button, level with the grid
 local GRID_Y     = -136
@@ -283,6 +286,103 @@ local function Money(copper)
   if g > 0 then out = out .. "|cffffd700" .. g .. "g|r " end
   if g > 0 or s > 0 then out = out .. "|cffc7c7cf" .. s .. "s|r " end
   return out .. "|cffeda55f" .. c .. "c|r"
+end
+
+-- Money written with coins instead of the letters g/s/c. The client cannot
+-- put a picture inside a line of text - the |T...|t escape came out as raw
+-- characters when probed (UiProbe 0.1.6) - so each coin is its own texture
+-- anchored beside its own number, and the caller says where the run starts.
+local MONEY_ATLAS = "Interface\\MoneyFrame\\UI-MoneyIcons"
+local COIN = 13
+
+local function TextW(fs)
+  if not fs then return 0 end
+  local t = fs.GetText and fs:GetText()
+  if not t or t == "" then return 0 end
+  if fs.GetStringWidth then
+    local ok, got = pcall(function() return fs:GetStringWidth() end)
+    if ok and type(got) == "number" and got > 0 then return got end
+  end
+  return string.len(t) * 6
+end
+
+local function CoinSplit(copper)
+  copper = copper or 0
+  local g = math.floor(copper / 10000)
+  local s = math.floor(copper / 100) - g * 100
+  local c = copper - math.floor(copper / 100) * 100
+  return { g, s, c }, { g > 0, (g > 0 or s > 0), true }
+end
+
+local function NewStrip(parent, size)
+  local st = { num = {}, icon = {} }
+  local k = 1
+  while k <= 3 do
+    local ic = parent:CreateTexture(nil, "OVERLAY")
+    ic:SetWidth(COIN)
+    ic:SetHeight(COIN)
+    ic:SetTexture(MONEY_ATLAS)
+    pcall(function() ic:SetTexCoord((k - 1) * 0.25, k * 0.25, 0, 1) end)
+    ic:Hide()
+    local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    pcall(function() fs:SetFont("Fonts\\FRIZQT__.TTF", size, "") end)
+    fs:SetJustifyH("LEFT")
+    fs:Hide()
+    st.icon[k], st.num[k] = ic, fs
+    k = k + 1
+  end
+  return st
+end
+
+-- how wide the run will be once it says this, so a right hand line can be
+-- shifted left by exactly that much
+local function StripW(st, copper)
+  local val, show = CoinSplit(copper)
+  local w, k = 0, 1
+  while k <= 3 do
+    if show[k] then
+      st.num[k]:SetText(val[k])
+      w = w + TextW(st.num[k]) + 1 + COIN + 5
+    end
+    k = k + 1
+  end
+  return w
+end
+
+local function StripHide(st)
+  if not st then return end
+  local k = 1
+  while k <= 3 do
+    st.icon[k]:Hide()
+    st.num[k]:Hide()
+    k = k + 1
+  end
+end
+
+-- point is the corner of `parent` the run hangs from, so the same helper
+-- serves a line at the top of the window and one at its foot
+local function StripPlace(st, parent, copper, point, x, y)
+  local val, show = CoinSplit(copper)
+  local k = 1
+  while k <= 3 do
+    if show[k] then
+      st.num[k]:SetText(val[k])
+      st.num[k]:ClearAllPoints()
+      st.num[k]:SetPoint(point, parent, point, x, y)
+      st.num[k]:Show()
+      x = x + TextW(st.num[k]) + 1
+
+      st.icon[k]:ClearAllPoints()
+      st.icon[k]:SetPoint(point, parent, point, x, y - 1)
+      st.icon[k]:Show()
+      x = x + COIN + 5
+    else
+      st.num[k]:Hide()
+      st.icon[k]:Hide()
+    end
+    k = k + 1
+  end
+  return x
 end
 
 local function Ago(stamp)
@@ -609,6 +709,33 @@ local function Tip(entry, owner)
   GameTooltip:Show()
 end
 
+-- Blizzard's own widgets where this client has them. Probed with UiProbe on
+-- this very build: UIPanelButtonTemplate, UICheckButtonTemplate and
+-- UIPanelCloseButton all exist AND their captions draw, which a bare
+-- CreateFrame("Button") cannot do - it has no FontString at all. CreateFrame
+-- with a template that is missing raises, hence the pcall and the fallbacks.
+local TMPL_BTN   = "UIPanelButtonTemplate"
+local TMPL_CHECK = "UICheckButtonTemplate"
+local TMPL_CLOSE = "UIPanelCloseButton"
+
+local function Templated(kind, name, parent, template)
+  local made
+  local ok = pcall(function()
+    made = CreateFrame(kind, name, parent, template)
+  end)
+  if ok and made then return made end
+  return nil
+end
+
+-- The slot picture and the patch of hide behind it, exactly as the bag
+-- window draws them. The numbers are not guesses: the ring is what
+-- ContainerFrame1Item1 reported (64x64, CENTER, one pixel high, no crop),
+-- and the hide is patch 3 of the six measured off the magnified
+-- UI-Bag-Components sheet.
+local RING_FILE = "Interface\\Buttons\\UI-Quickslot2"
+local BED_FILE  = "Interface\\ContainerFrame\\UI-Bag-Components"
+local BED_SPOT  = { 0.5130, 0.5759, 0.4333, 0.4963 }
+
 local function MakeFont(parent, size, r, g, b)
   local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   if not fs:GetFont() or fs:GetFont() == "" then
@@ -627,6 +754,22 @@ end
 -- something to click, which is exactly how the first build of this window
 -- looked in game.
 local function Flat(parent, w, h, label, name, framed)
+  -- A framed button is a real button in the game's eyes, so it gets the
+  -- game's own art. The unframed ones are rows of a list (the character
+  -- column): a raised plate under every name would read as eight buttons,
+  -- so those stay flat text with a highlight.
+  if framed then
+    local t = Templated("Button", name, parent, TMPL_BTN)
+    if t then
+      t:SetWidth(w)
+      if h < 22 then h = 22 end      -- the stock art needs the height
+      t:SetHeight(h)
+      t:SetText(label or "")
+      t.vaultStock = true
+      return t
+    end
+  end
+
   local b = CreateFrame("Button", name, parent)
   b:SetWidth(w)
   b:SetHeight(h)
@@ -647,7 +790,11 @@ local function Flat(parent, w, h, label, name, framed)
   return b
 end
 
--- one cell of the bag or bank grid
+-- One cell of the bag or bank grid, built the way the game builds its own:
+-- a patch of the bag's hide at the back, the item picture over it at full
+-- cell size, and Blizzard's slot ring on top at its native 64 pixels. The
+-- ring is what gets tinted for rarity, because with the picture filling the
+-- cell there is nothing else left showing.
 local function GetCell(i)
   if Cell[i] then return Cell[i] end
 
@@ -656,25 +803,29 @@ local function GetCell(i)
   b:SetHeight(SIZE)
   b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
 
-  local bg = b:CreateTexture(nil, "BACKGROUND")
-  bg:SetAllPoints(b)
-  bg:SetTexture(0.16, 0.16, 0.16, 1)
-
-  local inner = b:CreateTexture(nil, "BORDER")
-  inner:SetTexture(0.07, 0.07, 0.07, 1)
-  inner:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
-  inner:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
-
-  b:SetNormalTexture("")
-  local icon = b.GetNormalTexture and b:GetNormalTexture()
-  if icon then
-    icon:ClearAllPoints()
-    icon:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
-    icon:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+  local bed = b:CreateTexture(nil, "BACKGROUND")
+  bed:SetAllPoints(b)
+  bed:SetTexture(BED_FILE)
+  if bed.SetTexCoord then
+    pcall(function()
+      bed:SetTexCoord(BED_SPOT[1], BED_SPOT[2], BED_SPOT[3], BED_SPOT[4])
+    end)
   end
 
+  local icon = b:CreateTexture(nil, "ARTWORK")
+  icon:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
+  icon:SetWidth(SIZE)
+  icon:SetHeight(SIZE)
+  icon:Hide()
+
+  local ring = b:CreateTexture(nil, "OVERLAY")
+  ring:SetTexture(RING_FILE)
+  ring:SetWidth(64)
+  ring:SetHeight(64)
+  ring:SetPoint("CENTER", b, "CENTER", 0, 1)
+
   local fs = b:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
-  fs:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
+  fs:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -3, 3)
   fs:SetJustifyH("RIGHT")
   fs:SetTextColor(1, 1, 1)
 
@@ -685,7 +836,9 @@ local function GetCell(i)
   b:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
 
   Cell[i] = b
-  b.bg, b.inner, b.icon, b.count = bg, inner, icon, fs
+  -- bg keeps its old name on purpose: it is what the rarity colour goes on,
+  -- and that is now the ring
+  b.bg, b.inner, b.icon, b.count = ring, bed, icon, fs
   return b
 end
 
@@ -785,23 +938,25 @@ local function Build()
 
   local f = CreateFrame("Frame", "AllBagsVaultFrame", UIParent)
   W.frame = f
-  f:SetWidth(LIST_W + PAD * 2 + COLS * SIZE + 12)
+  -- the cells step by SIZE + GAP now, and the window has to be as wide as
+  -- ten of those steps or the last column falls off the right edge
+  f:SetWidth(LIST_W + PAD * 2 + CONTENT_W)
   f:SetHeight(560)
   f:SetFrameStrata("DIALOG")
   f:SetToplevel(true)
   f:SetMovable(true)
   f:EnableMouse(true)
-  -- The dialog-box background came out see-through on this client: the world
-  -- showed straight through the window. The tooltip background with an
-  -- explicit colour is what the bag window itself uses, and it is opaque.
+  -- Blizzard's carved dialog frame, the same one the bag window wears. Its
+  -- BACKGROUND file comes out see-through on this client (probed), so the
+  -- border is Blizzard's and the fill stays ours.
   f:SetBackdrop({
     bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tileSize = 16, edgeSize = 14,
-    insets   = { left = 4, right = 4, top = 4, bottom = 4 },
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 16, edgeSize = 32,
+    insets   = { left = 11, right = 12, top = 12, bottom = 11 },
   })
-  f:SetBackdropColor(0, 0, 0, 0.94)
-  f:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+  f:SetBackdropColor(0, 0, 0, 0.9)
+  f:SetBackdropBorderColor(1, 1, 1, 1)
   f:Hide()
 
   -- Escape closes it: the list holds names, so the frame needs one
@@ -862,7 +1017,7 @@ local function Build()
   -- when the snapshot was taken belongs next to the picture, not glued onto
   -- the end of the hint at the bottom
   W.stamp = MakeFont(f, 11, 0.5, 0.5, 0.5)
-  W.stamp:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD - 2, 30)
+  W.stamp:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD - 2, 38)
   W.stamp:SetWidth(150)
   W.stamp:SetJustifyH("RIGHT")
 
@@ -875,8 +1030,8 @@ local function Build()
   local i = 1
   while tabs[i] do
     local id, key = tabs[i][1], tabs[i][2]
-    local b = Flat(f, 74, 20, "", "AllBagsVaultTab" .. i, true)
-    b:SetPoint("TOPLEFT", f, "TOPLEFT", LIST_W + PAD + (i - 1) * 78, TABS_Y)
+    local b = Flat(f, 78, 22, "", "AllBagsVaultTab" .. i, true)
+    b:SetPoint("TOPLEFT", f, "TOPLEFT", LIST_W + PAD + (i - 1) * 82, TABS_Y)
     b:SetScript("OnClick", function()
       View.tab = id
       UpdateView()
@@ -889,37 +1044,38 @@ local function Build()
   -- the sheet the cells and rows live on
   W.grid = CreateFrame("Frame", "AllBagsVaultGrid", f)
   W.grid:SetPoint("TOPLEFT", f, "TOPLEFT", LIST_W + PAD, GRID_Y)
-  W.grid:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, 52)
-  W.grid:SetBackdrop({
-    bgFile   = "Interface\\ChatFrame\\ChatFrameBackground",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets = { left = 4, right = 4, top = 4, bottom = 4 },
-  })
-  W.grid:SetBackdropColor(0, 0, 0, 0.6)
+  W.grid:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, 74)
+  -- No plate of its own any more: the cells carry the game's own art and a
+  -- second frame around them was the "double border" the bag window had.
+  W.grid:SetBackdropColor(0, 0, 0, 0)
 
   W.empty = MakeFont(f, 12, 0.5, 0.5, 0.5)
   W.empty:SetPoint("TOPLEFT", W.grid, "TOPLEFT", 10, -10)
   W.empty:SetWidth(CONTENT_W - 20)
   W.empty:Hide()
 
+  -- coins for the three places a sum is written out
+  W.metaCoins  = NewStrip(f, 11)
+  W.totalCoins = NewStrip(f, 11)
+  W.sumCoins   = NewStrip(f, 11)
+
   W.total = MakeFont(f, 11, 0.62, 0.62, 0.62)
-  W.total:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 2, 50)
+  W.total:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 2, 56)
   W.total:SetWidth(LIST_W)
   W.total:SetJustifyH("LEFT")
 
   W.hint = MakeFont(f, 11, 0.5, 0.5, 0.5)
-  W.hint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 2, 30)
+  W.hint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 2, 38)
   W.hint:SetWidth(LIST_W + CONTENT_W - 160)   -- the stamp owns the right end
 
   -- what the lots add up to, when the auction tab is the one being looked at
   W.sum = MakeFont(f, 11, 0.75, 0.7, 0.5)
-  W.sum:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD - 2, 50)
+  W.sum:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD - 2, 56)
   W.sum:SetWidth(280)
   W.sum:SetJustifyH("RIGHT")
 
   W.forget = Flat(f, 90, 20, "", "AllBagsVaultForget", true)
-  W.forget:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, 12)
+  W.forget:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, 10)
   W.forget:SetScript("OnClick", function()
     if IsShiftKeyDown and IsShiftKeyDown() then
       local n = ForgetOthers()
@@ -947,8 +1103,19 @@ local function Build()
 
   -- Grouping: a bag read as a list of what is in it, not as a map of where
   -- every stack lies. Off gives the honest slot-by-slot picture back.
-  W.group = Flat(f, 132, 20, "", "AllBagsVaultGroup", true)
-  W.group:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 96, 12)
+  W.group = Templated("CheckButton", "AllBagsVaultGroup", f, TMPL_CHECK)
+  if W.group then
+    W.group.vaultCheck = true
+    W.group:SetWidth(24)
+    W.group:SetHeight(24)
+    W.groupFS = MakeFont(f, 11, 0.85, 0.85, 0.85)
+    W.groupFS:SetPoint("LEFT", W.group, "RIGHT", 2, 0)
+    W.groupFS:SetWidth(120)
+    W.groupFS:SetText(L("group"))
+  else
+    W.group = Flat(f, 132, 20, "", "AllBagsVaultGroup", true)
+  end
+  W.group:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + 110, 10)
   W.group:SetScript("OnClick", function()
     InitVault().group = not GroupOn()
     UpdateView()
@@ -962,8 +1129,18 @@ local function Build()
   end)
   W.group:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
 
-  W.close = Flat(f, 80, 20, "", "AllBagsVaultClose", true)
-  W.close:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, 12)
+  -- Blizzard's cross in the corner, where every window of the game keeps it,
+  -- instead of a worded button at the bottom. Its art is not centred in its
+  -- own 32 pixels - the cross draws about six pixels high - which is why it
+  -- is pinned at -9 and not at -3.
+  W.close = Templated("Button", "AllBagsVaultClose", f, TMPL_CLOSE)
+  if W.close then
+    W.close.vaultStock = true
+    W.close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -3, -9)
+  else
+    W.close = Flat(f, 80, 20, "", "AllBagsVaultClose", true)
+    W.close:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, 12)
+  end
   W.close:SetScript("OnClick", function() f:Hide() end)
 end
 
@@ -1092,17 +1269,42 @@ local function DrawAuc(rec)
   while Row[k] do Row[k]:Hide(); k = k + 1 end
 
   local total = rec and rec.aucTotal or n
-  local line = Lf("aucSum", n, Money(sum))
+  -- the coins own the right hand end, so the "and N more" tail goes in front
+  -- of the sentence instead of behind it
+  local line = ""
   if type(total) == "number" and total > n then
-    line = line .. "   |cff808080" .. Lf("aucMore", n, total) .. "|r"
+    line = "|cff808080" .. Lf("aucMore", n, total) .. "|r   "
   end
-  W.sum:SetText(n > 0 and line or "")
+  line = line .. Lf("aucSum", n, "")
+  if n > 0 then
+    W.sum:SetText(line)
+    local w = StripW(W.sumCoins, sum)
+    W.sum:ClearAllPoints()
+    W.sum:SetPoint("BOTTOMRIGHT", W.frame, "BOTTOMRIGHT", -PAD - 2 - w, 56)
+    StripPlace(W.sumCoins, W.frame, sum, "BOTTOMRIGHT", -PAD - 2 - w, 56 + 2)
+  else
+    W.sum:SetText("")
+    StripHide(W.sumCoins)
+  end
   return n
 end
 
 local function DrawGrid(list, n, showCounts, grouped)
+  -- The last row is filled out with empty cells. Asked both windows what
+  -- their cells are made of (/bags cmp) and the answer was the same to the
+  -- pixel - bed, picture and ring identical - yet the vault ones looked
+  -- boxed in. The reason was around them, not in them: in the bag every cell
+  -- has neighbours, so the metal that hangs off one ring lands on the next
+  -- picture and reads as a thin join. With nothing beside it the same metal
+  -- sits on black and reads as a wide dark frame. So the grid is drawn as a
+  -- full rectangle, the way a bag is.
+  local shownCells = n
+  if shownCells > 0 then
+    local rows = math.floor((shownCells + COLS - 1) / COLS)
+    shownCells = rows * COLS
+  end
   local i = 1
-  while i <= n do
+  while i <= shownCells do
     local c = GetCell(i)
     local e = list[i]
     local row = math.floor((i - 1) / COLS)
@@ -1112,18 +1314,15 @@ local function DrawGrid(list, n, showCounts, grouped)
 
     c.entry = e
     if e then
-      c:SetNormalTexture(e.t)
       if c.icon then
-        c.icon:ClearAllPoints()
-        c.icon:SetPoint("TOPLEFT", c, "TOPLEFT", 1, -1)
-        c.icon:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", -1, 1)
+        c.icon:SetTexture(e.t)
+        c.icon:Show()
       end
-      if c.inner then c.inner:Hide() end
       if e.q and e.q > 1 then
         local r, g, b = QualityColor(e.q)
-        c.bg:SetTexture(r, g, b, 1)
+        c.bg:SetVertexColor(r, g, b)
       else
-        c.bg:SetTexture(0.16, 0.16, 0.16, 1)
+        c.bg:SetVertexColor(1, 1, 1)
       end
       if showCounts then
         if e.c and e.c > 1 then c.count:SetText(e.c) else c.count:SetText("") end
@@ -1135,16 +1334,15 @@ local function DrawGrid(list, n, showCounts, grouped)
         c.count:SetText("")
       end
     else
-      c:SetNormalTexture("")
-      if c.inner then c.inner:Show() end
-      c.bg:SetTexture(0.16, 0.16, 0.16, 1)
+      if c.icon then c.icon:Hide() end
+      c.bg:SetVertexColor(1, 1, 1)
       c.count:SetText("")
     end
     c:Show()
     i = i + 1
   end
 
-  local k = n + 1
+  local k = shownCells + 1
   while Cell[k] do Cell[k]:Hide(); Cell[k].entry = nil; k = k + 1 end
   k = 1
   while Row[k] do Row[k]:Hide(); k = k + 1 end
@@ -1211,7 +1409,9 @@ UpdateView = function()
 
   W.title:SetText(L("title") .. "  |cff808080v" .. VERSION .. "|r")
   W.charsFS:SetText(L("chars"))
-  W.close:SetText("|cffffd700" .. L("close") .. "|r")
+  if not W.close.vaultStock then
+    W.close:SetText("|cffffd700" .. L("close") .. "|r")
+  end
 
   local i = 1
   while W.tab[i] do
@@ -1251,7 +1451,9 @@ UpdateView = function()
   for _, r in pairs(AllBagsVault.chars) do
     if type(r.money) == "number" then sum = sum + r.money end
   end
-  W.total:SetText("|cff9d9d9d" .. L("total") .. "|r " .. Money(sum))
+  W.total:SetText("|cff9d9d9d" .. L("total") .. "|r")
+  StripPlace(W.totalCoins, W.frame, sum, "BOTTOMLEFT",
+    PAD + 2 + TextW(W.total) + 8, 56 + 2)
 
   -- the character being played cannot be dropped: its snapshot is the live one
   local ownRow = (View.who == mine)
@@ -1261,10 +1463,12 @@ UpdateView = function()
   if not rec then
     W.who:SetText("")
     W.meta:SetText("")
+    StripHide(W.metaCoins)
     W.skills:SetText("")
     W.hint:SetText("")
     W.stamp:SetText("")
     W.sum:SetText("")
+    StripHide(W.sumCoins)
     W.empty:SetText(L("nobody"))
     W.empty:Show()
     DrawGrid({}, 0, false)
@@ -1279,16 +1483,41 @@ UpdateView = function()
   local meta = ""
   if rec.level then meta = Lf("level", rec.level) end
   if rec.class then meta = meta .. (meta ~= "" and ", " or "") .. rec.class end
-  if rec.money then meta = meta .. "   |cff9d9d9d" .. L("money") .. "|r " .. Money(rec.money) end
+  -- the money leaves the sentence and becomes coins right after it; what
+  -- follows the money moves onto the same run, so the line still reads left
+  -- to right: level, class, money, room left
+  -- The money leaves the sentence and becomes coins, so it has to be LAST in
+  -- the line: the coins are anchored after the text, and anything written
+  -- behind them would end up underneath. Room left therefore moves ahead of
+  -- it, which reads no worse: level, class, room left, money.
   if rec.slots and rec.slots > 0 then
     meta = meta .. "   |cff9d9d9d" .. L("free") .. "|r " .. (rec.free or 0) .. "|cff808080/" .. rec.slots .. "|r"
   end
+  local moneyAt = nil
+  if rec.money then
+    meta = meta .. "   |cff9d9d9d" .. L("money") .. "|r "
+    moneyAt = rec.money
+  end
   W.meta:SetText(meta)
+  if moneyAt then
+    StripPlace(W.metaCoins, W.frame, moneyAt, "TOPLEFT",
+      LIST_W + PAD + TextW(W.meta) + 4, -58 - 2)
+  else
+    StripHide(W.metaCoins)
+  end
   W.skills:SetText(SkillLine(rec))
 
   -- grouping only means something where there are containers
+  if W.group.vaultCheck then
+    W.group:SetChecked(GroupOn())
+    if W.groupFS then
+      W.groupFS:SetText((GroupOn() and "|cffffffff" or "|cff909090")
+        .. L("group") .. "|r")
+    end
+  else
   W.group:SetText((GroupOn() and "|cff40a040[x]|r " or "|cff707070[   ]|r ")
     .. L("group"))
+  end
   if View.tab == "bags" or View.tab == "bank" then
     W.group:Show()
   else
@@ -1310,6 +1539,7 @@ UpdateView = function()
 
   if View.tab == "gear" then
     W.sum:SetText("")
+    StripHide(W.sumCoins)
     W.hint:SetText(L("gearHint"))
     W.stamp:SetText(Lf("when", Ago(rec.gearAt)))
     if Count(rec.gear) == 0 and not rec.gearAt then
@@ -1334,6 +1564,7 @@ UpdateView = function()
   W.stamp:SetText(Lf("when", Ago(stamp)))
 
   W.sum:SetText("")
+  StripHide(W.sumCoins)
 
   local list, cells = Flatten(store, order)
   local slots = cells                 -- how many cells the character has here
@@ -1370,6 +1601,32 @@ local function Show()
   end
   UpdateView()
   f:Show()
+end
+
+-- What one cell of this window is really made of, for /bags cmp. Written
+-- here rather than read from the outside because only this file knows which
+-- texture is which.
+function AllBagsVault_CellInfo()
+  local c = Cell[1]
+  if not c then
+    Print("|cffffd700vault cell|r: " .. L("noData"))
+    return
+  end
+  Print("|cffffd700vault cell|r: " .. c:GetWidth() .. "x" .. c:GetHeight()
+    .. ", step " .. (SIZE + GAP))
+  local function Part(label, t)
+    if not t then Print("  " .. label .. ": -"); return end
+    local file, w, h, pt, x, y = nil, 0, 0, nil, nil, nil
+    pcall(function() file = t.GetTexture and t:GetTexture() end)
+    pcall(function() w, h = t:GetWidth(), t:GetHeight() end)
+    pcall(function() pt, _, _, x, y = t:GetPoint(1) end)
+    Print("  " .. label .. ": " .. tostring(file) .. " " .. tostring(w) .. "x"
+      .. tostring(h) .. " " .. tostring(pt) .. " (" .. tostring(x) .. ","
+      .. tostring(y) .. ")" .. (t:IsShown() and "" or " |cff808080hidden|r"))
+  end
+  Part("bed", c.inner)
+  Part("icon", c.icon)
+  Part("ring", c.bg)
 end
 
 local function Toggle()

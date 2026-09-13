@@ -3,7 +3,7 @@
 ## Notes: All bags in one window: sorting, favourites, and a vault view of other characters' bags, bank and gear.
 ## Notes-ruRU: Все сумки в одном окне: сортировка, избранное и просмотр сумок, банка и экипировки других персонажей.
 ## Author: Vivk
-## Version: 1.2.0
+## Version: 1.3.0
 ## SavedVariables: AllBagsDB, AllBagsVault
 
 AllBags.lua
